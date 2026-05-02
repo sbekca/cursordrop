@@ -2,12 +2,13 @@
 #SingleInstance Force
 
 ; ============================================================================
-; CursorDrop
+; CursorDrop v4 — Enterprise-grade floating drop zone
 ;
 ; Drag files or Ctrl+V clipboard images → SCP to remote
 ; .cursor-drop-files/ → auto-paste absolute path into Claude Code.
 ;
 ; Features:
+;   - Polished dark glass UI with smooth state transitions
 ;   - Resizable (drag edges/corners, right-click size presets, saves to .ini)
 ;   - Drag to reposition (saves position)
 ;   - Ctrl+V clipboard paste (images + files)
@@ -38,7 +39,10 @@ global CFG := {
     settingsFile:   A_ScriptDir . "\CursorDrop.ini",
     sshTimeout:     30,
     clipDir:        A_Temp . "\CursorDrop_clips",
-    watchDir:       EnvGet("USERPROFILE") . "\CursorDrop"
+    watchDir:       EnvGet("USERPROFILE") . "\CursorDrop",
+    videoFPS:       1,                  ; frames per second to extract from video
+    videoMaxSec:    30,                 ; max video duration to process (seconds)
+    videoExts:      "mp4,mov,webm,avi,mkv,wmv"
 }
 
 ; Color palettes — auto-detect Windows dark/light mode
@@ -167,6 +171,9 @@ LoadSettings() {
             isDarkMode := (dm = "1")
             COLORS := isDarkMode ? DARK : LIGHT
         }
+        fps := IniRead(CFG.settingsFile, "Video", "FPS", "")
+        if (fps != "")
+            CFG.videoFPS := Float(fps)
     }
 }
 
@@ -182,6 +189,7 @@ SaveSettings() {
         IniWrite(pinOffsetX, CFG.settingsFile, "Window", "PinOffsetX")
         IniWrite(pinOffsetY, CFG.settingsFile, "Window", "PinOffsetY")
         IniWrite(isDarkMode ? "1" : "0", CFG.settingsFile, "Window", "DarkMode")
+        IniWrite(CFG.videoFPS, CFG.settingsFile, "Video", "FPS")
     }
 }
 
@@ -418,7 +426,6 @@ SetState(state, detail := "") {
             WinSetTransparent(CFG.alphaActive, zone)
             SetTimer(() => SetState("idle"), -2500)
     }
-    zone.Show("NoActivate")
 }
 
 SetLabel(text, color) {
@@ -607,6 +614,23 @@ ShowZoneMenu(*) {
     sizeMenu.Add("Large    (260 × 72)", (*) => (ResizePill(260, 72), SaveSettings()))
     m.Add("Resize", sizeMenu)
 
+    ; Video FPS submenu
+    fpsMenu := Menu()
+    fpsMenu.Add("0.5 fps (1 frame per 2s)", (*) => SetVideoFPS(0.5))
+    fpsMenu.Add("1 fps (default)", (*) => SetVideoFPS(1))
+    fpsMenu.Add("2 fps (detailed)", (*) => SetVideoFPS(2))
+    fpsMenu.Add("4 fps (animations)", (*) => SetVideoFPS(4))
+    ; Check the current setting
+    if (CFG.videoFPS = 0.5)
+        fpsMenu.Check("0.5 fps (1 frame per 2s)")
+    else if (CFG.videoFPS = 1)
+        fpsMenu.Check("1 fps (default)")
+    else if (CFG.videoFPS = 2)
+        fpsMenu.Check("2 fps (detailed)")
+    else if (CFG.videoFPS = 4)
+        fpsMenu.Check("4 fps (animations)")
+    m.Add("Video frame rate", fpsMenu)
+
     m.Add()
     m.Add("Open watch folder", (*) => Run('explorer.exe "' CFG.watchDir '"'))
     m.Add("Clean remote files...", (*) => CleanRemoteFiles())
@@ -626,6 +650,13 @@ ToggleTheme(*) {
     SetState("idle")
     SaveSettings()
     Log("Theme: " (isDarkMode ? "dark" : "light"))
+}
+
+SetVideoFPS(fps) {
+    global CFG
+    CFG.videoFPS := fps
+    SaveSettings()
+    Log("Video FPS: " fps)
 }
 
 TogglePin(*) {
@@ -694,6 +725,10 @@ TrackEditorWindow() {
     if (!isPinned || isBusy || isResizing || isDragging || isHovering)
         return
 
+    ; Don't move the pill while user is dragging anything (mouse button held)
+    if (GetKeyState("LButton", "P"))
+        return
+
     editorHwnd := FindEditorHwnd()
     if (!editorHwnd)
         return
@@ -713,10 +748,11 @@ TrackEditorWindow() {
     targetX := ex + ew + pinOffsetX
     targetY := ey + eh + pinOffsetY
 
-    ; Only move if position actually changed
+    ; Only move if position actually changed by more than 1px
+    ; (prevents jitter from editor redraws during file drag-over)
     try {
         zone.GetPos(&cx, &cy)
-        if (cx = targetX && cy = targetY)
+        if (Abs(cx - targetX) <= 1 && Abs(cy - targetY) <= 1)
             return
     }
 
@@ -745,21 +781,26 @@ CheckDragHover() {
 
         if (overZone && !isHovering) {
             isHovering := true
-            ; Change colors directly without zone.Show to prevent jumping
             zone.BackColor := COLORS.hoverBg
-            SetLabel("Release", COLORS.hoverText)
-            SetSub("", "")
+            try {
+                ctrl := zone["Label"]
+                ctrl.Value := "Release"
+            }
         } else if (!overZone && isHovering) {
             isHovering := false
             zone.BackColor := COLORS.bg
-            SetLabel("Drop / Paste", COLORS.text)
-            SetSub("Ctrl+V or drag files", COLORS.sub)
+            try {
+                ctrl := zone["Label"]
+                ctrl.Value := "Drop / Paste"
+            }
         }
     } else if (isHovering) {
         isHovering := false
         zone.BackColor := COLORS.bg
-        SetLabel("Drop / Paste", COLORS.text)
-        SetSub("Ctrl+V or drag files", COLORS.sub)
+        try {
+            ctrl := zone["Label"]
+            ctrl.Value := "Drop / Paste"
+        }
     }
 }
 
@@ -1036,28 +1077,195 @@ UrlDecode(s) {
 }
 
 ; ============================================================================
+; Video → frames conversion (ffmpeg)
+; ============================================================================
+IsVideoFile(filePath) {
+    global CFG
+    SplitPath(filePath, , , &ext)
+    ext := StrLower(ext)
+    return InStr("," . CFG.videoExts . ",", "," . ext . ",")
+}
+
+HasFFmpeg() {
+    tmpFile := A_Temp . "\cursordrop_ffcheck.txt"
+    try FileDelete(tmpFile)
+    exitCode := RunWait(A_ComSpec . ' /c ffmpeg -version > "' tmpFile '" 2>&1', , "Hide")
+    return (exitCode = 0)
+}
+
+ExtractVideoFrames(videoPath) {
+    global CFG
+
+    if (!HasFFmpeg()) {
+        result := MsgBox(
+            "FFmpeg is required to extract frames from videos.`n`n"
+            . "Install it with:`n"
+            . "  winget install ffmpeg`n`n"
+            . "Or download from https://ffmpeg.org/download.html`n"
+            . "and add it to your PATH.`n`n"
+            . "Open the download page?",
+            "CursorDrop — FFmpeg required",
+            "YesNo Icon!"
+        )
+        if (result = "Yes")
+            Run("https://ffmpeg.org/download.html")
+        return []
+    }
+
+    SplitPath(videoPath, &fname, , &ext)
+    timestamp := FormatTime(, "yyyyMMdd-HHmmss")
+    frameDir := CFG.clipDir . "\frames-" . timestamp
+    DirCreate(frameDir)
+
+    ; Copy video to temp with a clean ASCII filename
+    ; (WhatsApp and macOS use non-breaking spaces and Unicode chars in filenames
+    ;  which break batch files / ffmpeg path handling)
+    tempVideo := CFG.clipDir . "\tempvideo-" . timestamp . "." . ext
+    try {
+        FileCopy(videoPath, tempVideo, true)
+        Log("Copied video to clean path: " tempVideo)
+    } catch as e {
+        Log("Failed to copy video: " e.Message)
+        SetState("error", "Copy failed")
+        return []
+    }
+
+    ; Get video duration via ffprobe
+    tmpFile := A_Temp . "\cursordrop_duration.txt"
+    try FileDelete(tmpFile)
+
+    RunWait(A_ComSpec . ' /c ffprobe -v error -show_entries format=duration -of csv=p=0 "' . tempVideo . '" > "' . tmpFile . '" 2>&1', , "Hide")
+
+    ; Log what ffprobe returned
+    probeOutput := ""
+    try probeOutput := Trim(FileRead(tmpFile, "UTF-8"))
+    Log("ffprobe output: [" probeOutput "]")
+
+    ; Strip any non-numeric characters (BOM, whitespace, etc)
+    cleanDuration := RegExReplace(probeOutput, "[^\d.]", "")
+    Log("Clean duration string: [" cleanDuration "]")
+
+    duration := 0
+    if (cleanDuration != "")
+        try duration := Float(cleanDuration)
+
+    Log("Parsed duration: " duration)
+
+    if (duration <= 0) {
+        Log("Could not get video duration: " videoPath)
+        SetState("error", "Bad video")
+        return []
+    }
+
+    clipDuration := Min(duration, CFG.videoMaxSec)
+
+    if (duration > CFG.videoMaxSec) {
+        result := MsgBox(
+            "Video is " . Round(duration) . "s long.`n"
+            . "Only the first " . CFG.videoMaxSec . "s will be extracted.`n`nContinue?",
+            "CursorDrop",
+            "YesNo Icon!"
+        )
+        if (result != "Yes")
+            return []
+    }
+
+    expectedFrames := Ceil(clipDuration * CFG.videoFPS)
+
+    ; Hard cap at 60 frames — protect against accidental 4fps × 30s = 120 frames
+    if (expectedFrames > 60) {
+        clipDuration := Floor(60 / CFG.videoFPS)
+        expectedFrames := 60
+        Log("Capped to 60 frames (" clipDuration "s at " CFG.videoFPS " fps)")
+    }
+
+    SetState("uploading", "Extracting " . expectedFrames . " frames...")
+    Log("Extracting: " fname " (" . Round(duration, 1) . "s → " . expectedFrames . " frames)")
+
+    ; Extract frames using the clean temp copy
+    ffmpegCmd := 'ffmpeg -i "' . tempVideo . '" -t ' . clipDuration . ' -vf "fps=' . CFG.videoFPS . '" -q:v 2 "' . frameDir . '\frame_%03d.jpg" -y'
+    Log("Run: " ffmpegCmd)
+    RunWait(A_ComSpec . ' /c ' . ffmpegCmd . ' > nul 2>&1', , "Hide")
+
+    ; Clean up temp video copy
+    try FileDelete(tempVideo)
+
+    frames := []
+    try {
+        Loop Files, frameDir . "\frame_*.jpg"
+            frames.Push(A_LoopFileFullPath)
+    }
+
+    if (frames.Length = 0) {
+        Log("No frames extracted from " fname)
+        SetState("error", "Extraction failed")
+        return []
+    }
+
+    Log("Got " . frames.Length . " frames from " fname)
+    return frames
+}
+
+; ============================================================================
 ; Upload files via SCP → instant path paste with background upload
 ;
 ; Flow:
-;   1. Build remote filenames locally (zero network, instant)
-;   2. Paste paths into terminal IMMEDIATELY — before any SSH call
-;   3. ssh mkdir -p + touch placeholders (single call, background)
-;   4. scp real files (background, overwrites placeholders)
+;   1. Pre-process: convert any videos to frames
+;   2. Build remote filenames locally (zero network, instant)
+;   3. Paste paths into terminal IMMEDIATELY — before any SSH call
+;   4. ssh mkdir -p + touch placeholders (single call, background)
+;   5. scp real files (background, overwrites placeholders)
 ;
 ; The path appears in Claude Code before anything hits the network.
 ; ============================================================================
 ProcessDrops(files, ctx) {
     global CFG
 
+    ; Separate videos from regular files
+    regularFiles := []
+    videoFiles := []
+    tempFrameDirs := []
+
+    for _, localPath in files {
+        if (!FileExist(localPath))
+            continue
+        if (IsVideoFile(localPath))
+            videoFiles.Push(localPath)
+        else
+            regularFiles.Push(localPath)
+    }
+
+    ; Process videos first — each gets its own remote subfolder
+    videoPaths := []    ; remote folder paths to paste
+    videoDirMap := []   ; { localDir, remoteDir } for batch SCP
+
+    for _, videoPath in videoFiles {
+        frames := ExtractVideoFrames(videoPath)
+        if (frames.Length = 0)
+            continue
+
+        SplitPath(frames[1], , &localFrameDir)
+        tempFrameDirs.Push(localFrameDir)
+
+        SplitPath(videoPath, &vname, , &vext)
+        timestamp := FormatTime(, "yyyyMMdd-HHmmss")
+        folderName := timestamp . "-" . SanitizeFilename(StrReplace(vname, "." . vext, "")) . "-frames"
+        remoteVideoDir := ctx.workspace . "/" . CFG.remoteSubdir . "/" . folderName
+        remoteVideoDir := StrReplace(remoteVideoDir, "//", "/")
+
+        videoPaths.Push(remoteVideoDir)
+        videoDirMap.Push({ localDir: localFrameDir, remoteDir: remoteVideoDir, count: frames.Length })
+    }
+
+    ; Build full list of paths to paste (video folders + regular file paths)
     remoteDir := ctx.workspace . "/" . CFG.remoteSubdir
     remoteDir := StrReplace(remoteDir, "//", "/")
 
-    ; Step 1: Build remote filenames locally — zero network
     remoteFiles := []
     localFiles := []
     touchParts := ""
 
-    for _, localPath in files {
+    for _, localPath in regularFiles {
         if (!FileExist(localPath)) {
             Log("Skip: " localPath)
             continue
@@ -1073,16 +1281,19 @@ ProcessDrops(files, ctx) {
         touchParts .= " " . ShellQuote(remotePath)
     }
 
-    if (remoteFiles.Length = 0) {
+    if (remoteFiles.Length = 0 && videoPaths.Length = 0) {
         SetState("error", "No files")
         return
     }
 
-    ; Step 2: Paste paths IMMEDIATELY — before any SSH call
+    ; Build payload — video folder paths + regular file paths
     payload := ""
+    for _, vp in videoPaths
+        payload .= (payload ? " " : "") . "'" . vp . "/'"
     for _, p in remoteFiles
         payload .= (payload ? " " : "") . "'" . p . "'"
 
+    ; Paste IMMEDIATELY — before any SSH call
     A_Clipboard := payload
 
     pasted := false
@@ -1104,24 +1315,40 @@ ProcessDrops(files, ctx) {
         Notify("Path copied — Ctrl+V in Claude Code.", false)
     }
 
-    ; Step 3: mkdir + touch placeholders (single SSH call, background)
-    n := remoteFiles.Length
-    SetState("uploading", "Syncing " . n . " file" . (n > 1 ? "s" : "") . "...")
+    ; Background: create remote dirs + placeholders
+    videoFrameCount := 0
+    for _, vd in videoDirMap
+        videoFrameCount += vd.count
+    totalFiles := remoteFiles.Length + videoDirMap.Length
+    SetState("uploading", "Syncing...")
 
-    mkTouchCmd := Format('ssh -o ConnectTimeout={1} {2} "mkdir -p {3} && touch{4}"',
-        CFG.sshTimeout, ctx.alias, ShellQuote(remoteDir), touchParts)
-    Log("Run: " mkTouchCmd)
-    if (!RunCommand(mkTouchCmd, &stderr)) {
+    ; Build mkdir commands for all needed directories
+    mkdirParts := ShellQuote(remoteDir)
+    for _, vp in videoPaths
+        mkdirParts .= " " . ShellQuote(vp)
+
+    mkCmd := Format('ssh -o ConnectTimeout={1} {2} "mkdir -p {3}"',
+        CFG.sshTimeout, ctx.alias, mkdirParts)
+
+    ; Add touch for regular files
+    if (touchParts != "")
+        mkCmd := Format('ssh -o ConnectTimeout={1} {2} "mkdir -p {3} && touch{4}"',
+            CFG.sshTimeout, ctx.alias, mkdirParts, touchParts)
+
+    Log("Run: " mkCmd)
+    if (!RunCommand(mkCmd, &stderr)) {
         SetState("error", "Remote prep failed")
-        Log("FAIL mkdir+touch: " stderr)
+        Log("FAIL mkdir: " stderr)
         return
     }
 
-    ; Step 4: SCP real files (overwrites empty placeholders)
+    ; SCP regular files
     failCount := 0
+    uploaded := 0
     for i, localPath in localFiles {
+        uploaded++
         SplitPath(localPath, &fname)
-        SetState("uploading", "Syncing " . i . "/" . n . " " . fname)
+        SetState("uploading", "Syncing " . uploaded . "/" . totalFiles . " " . fname)
 
         scpCmd := Format('scp -o ConnectTimeout={1} {2} {3}:{4}',
             CFG.sshTimeout,
@@ -1138,10 +1365,41 @@ ProcessDrops(files, ctx) {
         }
     }
 
+    ; SCP video frame directories (one scp call per video — all frames at once)
+    for _, vd in videoDirMap {
+        uploaded++
+        SetState("uploading", "Syncing " . uploaded . "/" . totalFiles . " (" . vd.count . " frames)")
+
+        ; scp all jpgs in the local frame dir to the remote dir in one shot
+        scpCmd := Format('scp -o ConnectTimeout={1} {2}\*.jpg {3}:{4}/',
+            CFG.sshTimeout,
+            ShellQuote(vd.localDir),
+            ctx.alias,
+            ShellQuote(vd.remoteDir))
+        Log("Run: " scpCmd)
+
+        if (!RunCommand(scpCmd, &stderr)) {
+            Log("FAIL scp frames: " stderr)
+            failCount++
+        } else {
+            Log("OK: " vd.count " frames -> " vd.remoteDir)
+        }
+    }
+
     if (failCount > 0) {
         SetState("error", failCount . " upload(s) failed")
     } else {
-        SetState("success", n . " file" . (n > 1 ? "s" : "") . " ready")
+        SetState("success", totalFiles . " file" . (totalFiles > 1 ? "s" : "") . " ready")
+    }
+
+    ; Clean up temp frame directories
+    for _, dir in tempFrameDirs {
+        try {
+            Loop Files, dir . "\*.*"
+                FileDelete(A_LoopFileFullPath)
+            DirDelete(dir)
+            Log("Cleaned temp frames: " dir)
+        }
     }
 }
 
