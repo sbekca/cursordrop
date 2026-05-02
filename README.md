@@ -31,7 +31,7 @@ The path is pasted into your terminal before any network call happens. By the ti
 
 1. Download and unzip `CursorDrop-macOS.zip`
 2. Run `bash install.sh`
-3. Grant Accessibility access when prompted
+3. Grant Accessibility access when prompted (or go to Settings -> Prviacy & Security -> Accessibility and press the "+" and find CursorDrop in Applications and add it, then toggle it on.
 
 Requires Xcode command line tools (the install script will prompt if missing). No other dependencies.
 
