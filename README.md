@@ -1,3 +1,4 @@
+[README (2).md](https://github.com/user-attachments/files/27297154/README.2.md)
 # CursorDrop
 
 Drag files or paste screenshots into a floating widget — they're instantly uploaded to your remote SSH server and the path appears in your Claude Code terminal. Zero friction.
@@ -8,39 +9,48 @@ Using Claude Code over SSH in Cursor or VS Code, getting a local file onto the r
 
 ## The Solution
 
-CursorDrop is a tiny floating pill that sits on top of your editor. Drop a file on it or Ctrl+V a screenshot — the remote path appears in your terminal instantly. The actual upload happens in the background.
+CursorDrop is a tiny floating pill that sits on top of your editor. Drop a file on it or paste a screenshot — the remote path appears in your terminal instantly. The actual upload happens in the background.
 
 ## How Fast?
 
 - **Drag a file** → path appears instantly, upload runs in background
-- **Ctrl+V a copied file** → instant (native Win32 clipboard, no PowerShell)
-- **Ctrl+V a screenshot** → ~50ms (native GDI+ encoding, no PowerShell)
+- **Paste a copied file** → instant
+- **Paste a screenshot** → ~50ms on Windows (native GDI+), ~100ms on macOS (native NSBitmapImageRep)
 
 The path is pasted into your terminal before any network call happens. By the time you finish typing your prompt and hit Enter, the file is already there.
 
 ## Install
 
+### Windows
+
 1. Install [AutoHotkey v2](https://www.autohotkey.com/)
 2. Download `CursorDrop.ahk`
 3. Double-click to run
 
-That's it.
+### macOS
+
+1. Download and unzip `CursorDrop-macOS.zip`
+2. Run `bash install.sh`
+3. Grant Accessibility access when prompted
+
+Requires Xcode command line tools (the install script will prompt if missing). No other dependencies.
 
 ## Requirements
 
-- Windows 10/11
-- AutoHotkey v2
 - SSH key auth configured — `scp yourhost:/path` must work without a password prompt
 - Cursor or VS Code connected to a remote server via Remote-SSH
+- Windows 10/11 or macOS 13+
 - [FFmpeg](https://ffmpeg.org/) (optional — only needed for video frame extraction)
 
 ## Usage
 
-**Drag and drop** — drag any file from Explorer onto the pill.
+**Drag and drop** — drag any file from Explorer/Finder onto the pill.
 
-**Clipboard paste** — copy a file (right-click → Copy) or take a screenshot (Win+Shift+S), click the pill, press Ctrl+V.
+**Clipboard paste** — copy a file or take a screenshot, then:
+- **Windows:** click the pill, press Ctrl+V
+- **macOS:** press Ctrl+Cmd+V from anywhere, or click the ⬆ menubar icon
 
-**Watch folder** — drop files into `%USERPROFILE%\CursorDrop\` from any app. They're automatically uploaded and the local copy is deleted. Works great with [LocalSend](https://localsend.org/) for sending files from your phone.
+**Watch folder** — drop files into `~/CursorDrop/` from any app. They're automatically uploaded and the local copy is deleted. Works great with [LocalSend](https://localsend.org/) for sending files from your phone.
 
 **Right-click menu:**
 - Pin/unpin to editor window
@@ -63,9 +73,13 @@ Drop a video file onto CursorDrop and it extracts frames using FFmpeg, uploads t
 - 2 fps — more detail, for faster interactions
 - 4 fps — animations and quick UI transitions
 
-Videos longer than 30 seconds are clipped. Hard cap of 60 frames to prevent accidents.
+Videos longer than 30 seconds are clipped. Hard cap of 60 frames.
 
-**Install FFmpeg:** `winget install ffmpeg` in PowerShell, or download from [ffmpeg.org](https://ffmpeg.org/download.html). CursorDrop will prompt you if it's missing when you drop a video.
+**Install FFmpeg:**
+- Windows: `winget install ffmpeg`
+- macOS: `brew install ffmpeg`
+
+CursorDrop will prompt you if FFmpeg is missing when you drop a video.
 
 **Remote structure:**
 ```
@@ -79,12 +93,12 @@ Videos longer than 30 seconds are clipped. Hard cap of 60 frames to prevent acci
 
 ## Watch Folder & LocalSend
 
-CursorDrop watches `%USERPROFILE%\CursorDrop\` for new files. Anything dropped in that folder is automatically uploaded to the remote server, the path is pasted into your terminal, and the local copy is deleted.
+CursorDrop watches `~/CursorDrop/` for new files. Anything dropped in that folder is automatically uploaded, the path is pasted into your terminal, and the local copy is deleted.
 
-This works with any app, but it's especially useful with [LocalSend](https://localsend.org/):
+To send files from your phone directly into Claude Code:
 
-1. Install LocalSend on your PC and phone
-2. In LocalSend settings on PC, set the save directory to `%USERPROFILE%\CursorDrop`
+1. Install [LocalSend](https://localsend.org/) on your PC/Mac and phone
+2. In LocalSend settings, set the save directory to `~/CursorDrop`
 3. Enable Quick Save
 4. Send a file from your phone — the path appears in Claude Code automatically
 
@@ -92,7 +106,7 @@ This works with any app, but it's especially useful with [LocalSend](https://loc
 
 - Pins to your Cursor/VS Code window — follows it across monitors as you move or resize
 - Drag the pill while pinned to set a custom offset
-- Dark and light mode (auto-detects Windows theme, or toggle manually)
+- Dark and light mode (auto-detects system theme, or toggle manually)
 - Resizable — drag edges or pick a preset
 - Remembers size, position, pin offset, theme, and video FPS across restarts
 - Remote files go into `.cursor-drop-files/` under your workspace root
@@ -108,8 +122,6 @@ This works with any app, but it's especially useful with [LocalSend](https://loc
 
 For videos: frames are extracted locally with FFmpeg, then uploaded as a folder in a single `scp` call.
 
-For screenshots: saved via native GDI+ DllCalls — no PowerShell process spawn.
-
 ## Supported Editors
 
 - Cursor
@@ -120,13 +132,17 @@ Automatically detects the active editor, reads the SSH alias from the window tit
 
 ## Configuration
 
+### Windows
 Edit the config block at the top of `CursorDrop.ahk`:
+
+### macOS
+Settings are saved automatically to `~/.config/cursordrop/settings.json`. Configure via the right-click menu.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `remoteSubdir` | `.cursor-drop-files` | Folder created under your remote workspace root |
 | `sshTimeout` | `30` | SSH/SCP timeout in seconds |
-| `watchDir` | `%USERPROFILE%\CursorDrop` | Local folder watched for new files |
+| `watchDir` | `~/CursorDrop` | Local folder watched for new files |
 | `videoFPS` | `1` | Frames per second for video extraction |
 | `videoMaxSec` | `30` | Max video duration to process |
 
