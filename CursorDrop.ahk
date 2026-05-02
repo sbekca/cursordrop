@@ -2,106 +2,65 @@
 #SingleInstance Force
 
 ; ============================================================================
-; CursorDrop v4 — Enterprise-grade floating drop zone
+; CursorDrop v4
 ;
 ; Drag files or Ctrl+V clipboard images → SCP to remote
 ; .cursor-drop-files/ → auto-paste absolute path into Claude Code.
-;
-; Features:
-;   - Polished dark glass UI with smooth state transitions
-;   - Resizable (drag edges/corners, right-click size presets, saves to .ini)
-;   - Drag to reposition (saves position)
-;   - Ctrl+V clipboard paste (images + files)
-;   - Supports Cursor, VS Code, VS Code Insiders
-;   - Hex-encoded Cursor storage.json format
-;   - Cleanup with confirmation dialog
-;
-; Requirements:
-;   - AutoHotkey v2.0+
-;   - Windows OpenSSH (ssh / scp on PATH)
-;   - SSH key auth configured
-;   - Cursor or VS Code connected via Remote-SSH
 ; ============================================================================
 
 ; ----- Config ---------------------------------------------------------------
 global CFG := {
-    defW:           160,                ; default width
-    defH:           52,                 ; default height
+    defW:           160,
+    defH:           52,
     minW:           100,
     minH:           40,
     maxW:           500,
     maxH:           250,
     resizeGrip:     8,
-    alphaIdle:      245,
-    alphaActive:    255,
     remoteSubdir:   ".cursor-drop-files",
     logFile:        A_ScriptDir . "\CursorDrop.log",
     settingsFile:   A_ScriptDir . "\CursorDrop.ini",
     sshTimeout:     30,
     clipDir:        A_Temp . "\CursorDrop_clips",
     watchDir:       EnvGet("USERPROFILE") . "\CursorDrop",
-    videoFPS:       1,                  ; frames per second to extract from video
-    videoMaxSec:    30,                 ; max video duration to process (seconds)
+    videoFPS:       1,
+    videoMaxSec:    30,
     videoExts:      "mp4,mov,webm,avi,mkv,wmv"
 }
 
-; Color palettes — auto-detect Windows dark/light mode
+; Auto dark/light
 global isDarkMode := DetectDarkMode()
 
 DetectDarkMode() {
     try {
         val := RegRead("HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme")
-        return (val = 0)  ; 0 = dark mode, 1 = light mode
+        return (val = 0)
     } catch {
-        return true  ; default to dark
+        return true
     }
 }
 
 global DARK := {
-    bg:             "222222",
-    text:           "E0E0E0",
-    sub:            "888888",
-    hoverBg:        "1B3328",
-    hoverText:      "7FD4A0",
-    hoverSub:       "5AA87A",
-    readBg:         "2A2235",
-    readText:       "C4A8E0",
-    readSub:        "9A7DBF",
-    uploadBg:       "2E2818",
-    uploadText:     "E8C86A",
-    uploadSub:      "BFA44E",
-    successBg:      "1B3328",
-    successText:    "7FD4A0",
-    successSub:     "5AA87A",
-    errorBg:        "351E1E",
-    errorText:      "E87070",
-    errorSub:       "C05050"
+    bg: "222222", text: "E0E0E0", sub: "888888",
+    hoverBg: "1B3328", hoverText: "7FD4A0",
+    readBg: "2A2235", readText: "C4A8E0", readSub: "9A7DBF",
+    uploadBg: "2E2818", uploadText: "E8C86A", uploadSub: "BFA44E",
+    successBg: "1B3328", successText: "7FD4A0", successSub: "5AA87A",
+    errorBg: "351E1E", errorText: "E87070", errorSub: "C05050"
 }
 
 global LIGHT := {
-    bg:             "FAFAFA",
-    text:           "222222",
-    sub:            "999999",
-    hoverBg:        "E8F5EC",
-    hoverText:      "2E8B4E",
-    hoverSub:       "5AA87A",
-    readBg:         "F0E8F8",
-    readText:       "7B3FA0",
-    readSub:        "9A7DBF",
-    uploadBg:       "FFF5E0",
-    uploadText:     "B88A20",
-    uploadSub:      "D4A830",
-    successBg:      "E8F5EC",
-    successText:    "2E8B4E",
-    successSub:     "5AA87A",
-    errorBg:        "FDE8E8",
-    errorText:      "C03030",
-    errorSub:       "D05050"
+    bg: "FAFAFA", text: "222222", sub: "999999",
+    hoverBg: "E8F5EC", hoverText: "2E8B4E",
+    readBg: "F0E8F8", readText: "7B3FA0", readSub: "9A7DBF",
+    uploadBg: "FFF5E0", uploadText: "B88A20", uploadSub: "D4A830",
+    successBg: "E8F5EC", successText: "2E8B4E", successSub: "5AA87A",
+    errorBg: "FDE8E8", errorText: "C03030", errorSub: "D05050"
 }
 
 global COLORS := isDarkMode ? DARK : LIGHT
 
-; Editor processes
+; Editors
 global EDITORS := [
     { exe: "Cursor.exe",              appData: "Cursor" },
     { exe: "Code.exe",                appData: "Code" },
@@ -112,9 +71,9 @@ global isHovering := false
 global isBusy := false
 global isResizing := false
 global isDragging := false
-global isPinned := true                ; pin to editor window by default
-global pinOffsetX := -24               ; offset from editor right edge
-global pinOffsetY := -70               ; offset from editor bottom edge
+global isPinned := true
+global pinOffsetX := -24
+global pinOffsetY := -70
 global resizeEdge := ""
 global resizeStartX := 0
 global resizeStartY := 0
@@ -123,19 +82,16 @@ global resizeStartH := 0
 global resizeStartPosX := 0
 global resizeStartPosY := 0
 
-; Ensure dirs
 DirCreate(CFG.clipDir)
 DirCreate(CFG.watchDir)
 
-; Track known files in watch folder (so we only process new ones)
 global watchKnownFiles := Map()
-ScanWatchFolder()  ; snapshot current contents so we don't re-upload existing files
 
-; Load saved settings (size + position)
 LoadSettings()
+ScanWatchFolder()
 
 ; ============================================================================
-; Settings persistence
+; Settings
 ; ============================================================================
 LoadSettings() {
     global CFG, isPinned, pinOffsetX, pinOffsetY, isDarkMode, COLORS, DARK, LIGHT
@@ -194,14 +150,13 @@ SaveSettings() {
 }
 
 ; ============================================================================
-; Build the GUI — clean flat
+; Build GUI — simple, no layered window nonsense
 ; ============================================================================
-zone := Gui("+AlwaysOnTop -Caption +ToolWindow +LastFound +E0x10 +E0x80000")
+zone := Gui("+AlwaysOnTop -Caption +ToolWindow +LastFound")
 zone.BackColor := COLORS.bg
 zone.MarginX := 0
 zone.MarginY := 0
 
-; Main label + subtitle, vertically centered as a pair
 labelH := 18
 subH := 14
 totalH := labelH + subH + 2
@@ -214,78 +169,61 @@ zone.Add("Text", "x0 y" labelY " w" CFG.zoneW " h" labelH " Center c" COLORS.tex
 zone.SetFont("s8 w400", "Segoe UI")
 zone.Add("Text", "x0 y" subY " w" CFG.zoneW " h" subH " Center c" COLORS.sub " vSubLabel BackgroundTrans", "Ctrl+V or drag files")
 
-; Resize grip
 zone.SetFont("s7 w400", "Segoe UI")
 zone.Add("Text", "x" (CFG.zoneW - 14) " y" (CFG.zoneH - 14) " w14 h14 c" COLORS.sub " vGrip BackgroundTrans", "⋱")
 
-; Position — use saved position, then recalculate pin offset if pinned
+; Position — safe default at center of primary screen
+posX := (A_ScreenWidth - CFG.zoneW) // 2
+posY := (A_ScreenHeight - CFG.zoneH) // 2
+
 if (CFG.savedX != "" && CFG.savedY != "") {
     posX := Integer(CFG.savedX)
     posY := Integer(CFG.savedY)
-} else {
-    ; No saved position — default to bottom-right of editor or screen
-    posX := 0
-    posY := 0
-    editorFound := false
-    for ed in EDITORS {
-        try {
-            h := WinExist("ahk_exe " ed.exe)
-            if (h) {
-                WinGetPos(&ex, &ey, &ew, &eh, h)
-                if (ew > 0 && eh > 0) {
-                    posX := ex + ew - CFG.zoneW - 24
-                    posY := ey + eh - CFG.zoneH - 70
-                    editorFound := true
-                    break
-                }
-            }
-        }
-    }
-    if (!editorFound) {
-        posX := A_ScreenWidth - CFG.zoneW - 24
-        posY := A_ScreenHeight - CFG.zoneH - 70
-    }
 }
 
 zone.Show("x" posX " y" posY " w" CFG.zoneW " h" CFG.zoneH " NoActivate")
 
-; If pinned, recalculate offset from current position relative to editor
-if (isPinned) {
-    SetTimer(() => RecalcPinOffset(), -500)
-}
+; Force topmost z-order (above other always-on-top windows like Cursor)
+DllCall("SetWindowPos", "Ptr", zone.Hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0003)  ; HWND_TOPMOST + SWP_NOMOVE|SWP_NOSIZE
 
-; Apply rounded region
+; Rounded corners
 cornerR := Min(CFG.zoneH // 2, 22)
-ApplyRoundedRegion(zone.Hwnd, CFG.zoneW, CFG.zoneH, cornerR)
-WinSetTransparent(CFG.alphaIdle, zone)
+hRgn := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", CFG.zoneW + 1, "Int", CFG.zoneH + 1, "Int", cornerR, "Int", cornerR, "Ptr")
+DllCall("SetWindowRgn", "Ptr", zone.Hwnd, "Ptr", hRgn, "Int", 1)
 
-; Accept file drops
+; Transparency
+WinSetTransparent(245, zone)
+
+; Accept drops
 DllCall("shell32\DragAcceptFiles", "Ptr", zone.Hwnd, "Int", 1)
 OnMessage(0x233, HandleDrop)
 
-; Hover feedback timer
+; Timers
 SetTimer(CheckDragHover, 70)
-
-; Pin-to-editor tracking timer
 SetTimer(TrackEditorWindow, 200)
-
-; Watch folder timer (for LocalSend / manual drops into ~/CursorDrop)
 SetTimer(CheckWatchFolder, 1000)
 
-; Mouse handlers for drag + resize
+; Mouse
 OnMessage(0x201, HandleLButtonDown)
 OnMessage(0x200, HandleMouseMove)
 
-; Right-click context menu
+; Right-click
 zone.OnEvent("ContextMenu", ShowZoneMenu)
 
-; Hotkeys when zone is focused
+; Hotkeys
 HotIfWinActive("ahk_id " zone.Hwnd)
 Hotkey("^v", PasteClipboard)
 Hotkey("Escape", (*) => ExitApp())
 HotIf()
 
-; ---- Tray ----
+; Global hotkey: Ctrl+Shift+D to bring pill to center of active monitor
+Hotkey("^+d", CenterOnScreen)
+
+; If pinned, recalculate offset after a moment
+if (isPinned)
+    SetTimer(() => RecalcPinOffset(), -500)
+
+; Tray
 A_TrayMenu.Delete()
 A_TrayMenu.Add("Show log", (*) => Run('notepad.exe "' CFG.logFile '"'))
 A_TrayMenu.Add("Open watch folder", (*) => Run('explorer.exe "' CFG.watchDir '"'))
@@ -304,15 +242,7 @@ Log("CursorDrop v4 started (" CFG.zoneW "x" CFG.zoneH ")")
 return
 
 ; ============================================================================
-; Rounded region
-; ============================================================================
-ApplyRoundedRegion(hwnd, w, h, r) {
-    hRgn := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", w + 1, "Int", h + 1, "Int", r, "Int", r, "Ptr")
-    DllCall("SetWindowRgn", "Ptr", hwnd, "Ptr", hRgn, "Int", 1)
-}
-
-; ============================================================================
-; Resize the pill and reflow all controls
+; Resize
 ; ============================================================================
 ResizePill(newW, newH) {
     global zone, CFG
@@ -322,21 +252,19 @@ ResizePill(newW, newH) {
     CFG.zoneW := newW
     CFG.zoneH := newH
 
-    ; Calculate centered positions
-    labelH := 20
+    labelH := 18
     subH := 14
     showSub := (newH >= 48)
 
     if (showSub) {
         totalH := labelH + subH
         labelY := (newH - totalH) // 2
-        subY := labelY + labelH + 1
+        subY := labelY + labelH + 2
     } else {
         labelY := (newH - labelH) // 2
         subY := 0
     }
 
-    ; Reposition controls
     ctrl := zone["Label"]
     ctrl.Move(0, labelY, newW, labelH)
 
@@ -351,7 +279,6 @@ ResizePill(newW, newH) {
     grip := zone["Grip"]
     grip.Move(newW - 14, newH - 14, 14, 14)
 
-    ; Adjust font size based on width
     fontSize := 10
     if (newW >= 240)
         fontSize := 13
@@ -359,22 +286,41 @@ ResizePill(newW, newH) {
         fontSize := 11
     else if (newW < 120)
         fontSize := 9
-
     ctrl.SetFont("s" fontSize " w600")
+    subCtrl.SetFont("s8 w400")
 
-    ; Resize window + reapply region
+    ; Resize window in place — get position BEFORE Show
     zone.GetPos(&cx, &cy)
+
+    ; Temporarily stop pin tracking
+    SetTimer(TrackEditorWindow, 0)
+
     zone.Show("x" cx " y" cy " w" newW " h" newH " NoActivate")
 
     cornerR := Min(newH // 2, 22)
-    ApplyRoundedRegion(zone.Hwnd, newW, newH, cornerR)
+    hRgn := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", newW + 1, "Int", newH + 1, "Int", cornerR, "Int", cornerR, "Ptr")
+    DllCall("SetWindowRgn", "Ptr", zone.Hwnd, "Ptr", hRgn, "Int", 1)
 
-    ; Re-accept drops after region change
     DllCall("shell32\DragAcceptFiles", "Ptr", zone.Hwnd, "Int", 1)
+    DllCall("SetWindowPos", "Ptr", zone.Hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0003)
+
+    ; Re-apply colors without moving
+    zone.BackColor := COLORS.bg
+    ctrl.SetFont("c" COLORS.text)
+    ctrl.Value := "Drop / Paste"
+    if (showSub) {
+        subCtrl.SetFont("c" COLORS.sub)
+        subCtrl.Value := "Ctrl+V or drag files"
+    }
+
+    ; Recalculate pin offset from new position, then resume tracking
+    if (isPinned)
+        RecalcPinOffset()
+    SetTimer(TrackEditorWindow, 200)
 }
 
 ; ============================================================================
-; Visual state machine
+; State
 ; ============================================================================
 SetState(state, detail := "") {
     global zone, CFG, isBusy, COLORS
@@ -385,20 +331,17 @@ SetState(state, detail := "") {
             zone.BackColor := COLORS.bg
             SetLabel("Drop / Paste", COLORS.text)
             SetSub("Ctrl+V or drag files", COLORS.sub)
-            WinSetTransparent(CFG.alphaIdle, zone)
 
         case "hover":
             zone.BackColor := COLORS.hoverBg
             SetLabel("Release", COLORS.hoverText)
             SetSub("", "")
-            WinSetTransparent(CFG.alphaActive, zone)
 
         case "reading":
             isBusy := true
             zone.BackColor := COLORS.readBg
             SetLabel("Reading...", COLORS.readText)
             SetSub("Checking clipboard", COLORS.readSub)
-            WinSetTransparent(CFG.alphaActive, zone)
 
         case "uploading":
             isBusy := true
@@ -406,7 +349,6 @@ SetState(state, detail := "") {
             msg := detail ? detail : "Uploading..."
             SetLabel(msg, COLORS.uploadText)
             SetSub("Syncing to remote", COLORS.uploadSub)
-            WinSetTransparent(CFG.alphaActive, zone)
 
         case "success":
             isBusy := false
@@ -414,7 +356,6 @@ SetState(state, detail := "") {
             msg := detail ? detail : "Done"
             SetLabel(msg, COLORS.successText)
             SetSub("Path pasted", COLORS.successSub)
-            WinSetTransparent(CFG.alphaActive, zone)
             SetTimer(() => SetState("idle"), -1500)
 
         case "error":
@@ -423,7 +364,6 @@ SetState(state, detail := "") {
             msg := detail ? detail : "Error"
             SetLabel(msg, COLORS.errorText)
             SetSub("Check log", COLORS.errorSub)
-            WinSetTransparent(CFG.alphaActive, zone)
             SetTimer(() => SetState("idle"), -2500)
     }
 }
@@ -449,11 +389,11 @@ SetSub(text, color) {
 }
 
 ; ============================================================================
-; Mouse handlers — drag to move, edge-drag to resize
+; Mouse — drag + resize
 ; ============================================================================
 HandleLButtonDown(wParam, lParam, msg, hwnd) {
-    global zone, CFG, isResizing, isDragging, isPinned, resizeEdge, resizeStartX, resizeStartY
-    global resizeStartW, resizeStartH, resizeStartPosX, resizeStartPosY
+    global zone, CFG, isResizing, isDragging, isPinned, resizeEdge
+    global resizeStartX, resizeStartY, resizeStartW, resizeStartH, resizeStartPosX, resizeStartPosY
 
     if (hwnd != zone.Hwnd)
         return
@@ -462,11 +402,9 @@ HandleLButtonDown(wParam, lParam, msg, hwnd) {
     MouseGetPos(&mx, &my)
     zone.GetPos(&zx, &zy, &zw, &zh)
 
-    ; Check if mouse is near an edge (resize zone)
     edge := GetResizeEdge(mx, my, zx, zy, zw, zh)
 
     if (edge != "") {
-        ; Start resize
         isResizing := true
         resizeEdge := edge
         resizeStartX := mx
@@ -479,18 +417,12 @@ HandleLButtonDown(wParam, lParam, msg, hwnd) {
         return
     }
 
-    ; Normal drag to reposition
     isDragging := true
-    ; Pause pin tracking while dragging
     SetTimer(TrackEditorWindow, 0)
-    ; SendMessage blocks until the user releases the mouse (unlike PostMessage)
-    SendMessage(0xA1, 2,,, zone)  ; WM_NCLBUTTONDOWN, HTCAPTION
-    ; Drag complete — recalculate offset from new position
-    if (isPinned) {
+    SendMessage(0xA1, 2,,, zone)
+    if (isPinned)
         RecalcPinOffset()
-    }
     isDragging := false
-    ; Resume pin tracking
     SetTimer(TrackEditorWindow, 200)
     SaveSettings()
 }
@@ -506,22 +438,21 @@ HandleMouseMove(wParam, lParam, msg, hwnd) {
 
     edge := GetResizeEdge(mx, my, zx, zy, zw, zh)
 
-    ; Set cursor based on edge
     if (edge = "br" || edge = "tl")
-        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32642, "Ptr"))  ; SIZENWSE
+        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32642, "Ptr"))
     else if (edge = "r" || edge = "l")
-        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32644, "Ptr"))  ; SIZEWE
+        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32644, "Ptr"))
     else if (edge = "b" || edge = "t")
-        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32645, "Ptr"))  ; SIZENS
+        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32645, "Ptr"))
 }
 
 GetResizeEdge(mx, my, zx, zy, zw, zh) {
     global CFG
     g := CFG.resizeGrip
-    onRight  := (mx >= zx + zw - g && mx <= zx + zw)
+    onRight := (mx >= zx + zw - g && mx <= zx + zw)
     onBottom := (my >= zy + zh - g && my <= zy + zh)
-    onLeft   := (mx >= zx && mx <= zx + g)
-    onTop    := (my >= zy && my <= zy + g)
+    onLeft := (mx >= zx && mx <= zx + g)
+    onTop := (my >= zy && my <= zy + g)
 
     if (onRight && onBottom)
         return "br"
@@ -544,7 +475,6 @@ ResizeTick() {
     global zone, CFG
 
     if (!GetKeyState("LButton", "P")) {
-        ; Mouse released — finish resize
         isResizing := false
         resizeEdge := ""
         SetTimer(ResizeTick, 0)
@@ -578,7 +508,6 @@ ResizeTick() {
     newW := Max(CFG.minW, Min(CFG.maxW, newW))
     newH := Max(CFG.minH, Min(CFG.maxH, newH))
 
-    ; Clamp position if resizing from left/top
     if InStr(resizeEdge, "l")
         newX := resizeStartPosX + resizeStartW - newW
     if InStr(resizeEdge, "t")
@@ -592,21 +521,18 @@ ResizeTick() {
 ; Right-click menu
 ; ============================================================================
 ShowZoneMenu(*) {
-    global isPinned, isDarkMode
+    global isPinned, isDarkMode, CFG
     m := Menu()
 
     m.Add("Paste clipboard", (*) => PasteClipboard())
     m.Add()
 
-    ; Pin toggle
     pinLabel := isPinned ? "✓ Pinned to editor" : "Pin to editor"
     m.Add(pinLabel, TogglePin)
 
-    ; Theme toggle
     themeLabel := isDarkMode ? "Switch to light" : "Switch to dark"
     m.Add(themeLabel, ToggleTheme)
 
-    ; Size presets submenu
     sizeMenu := Menu()
     sizeMenu.Add("Compact  (120 × 44)", (*) => (ResizePill(120, 44), SaveSettings()))
     sizeMenu.Add("Default  (160 × 52)", (*) => (ResizePill(160, 52), SaveSettings()))
@@ -614,13 +540,11 @@ ShowZoneMenu(*) {
     sizeMenu.Add("Large    (260 × 72)", (*) => (ResizePill(260, 72), SaveSettings()))
     m.Add("Resize", sizeMenu)
 
-    ; Video FPS submenu
     fpsMenu := Menu()
     fpsMenu.Add("0.5 fps (1 frame per 2s)", (*) => SetVideoFPS(0.5))
     fpsMenu.Add("1 fps (default)", (*) => SetVideoFPS(1))
     fpsMenu.Add("2 fps (detailed)", (*) => SetVideoFPS(2))
     fpsMenu.Add("4 fps (animations)", (*) => SetVideoFPS(4))
-    ; Check the current setting
     if (CFG.videoFPS = 0.5)
         fpsMenu.Check("0.5 fps (1 frame per 2s)")
     else if (CFG.videoFPS = 1)
@@ -663,8 +587,6 @@ TogglePin(*) {
     global isPinned
     isPinned := !isPinned
     if (isPinned) {
-        ; Recalculate offset from where the pill IS right now
-        ; so it doesn't jump when TrackEditorWindow fires
         RecalcPinOffset()
         Log("Pin mode: ON (offset: " pinOffsetX ", " pinOffsetY ")")
     } else {
@@ -675,8 +597,8 @@ TogglePin(*) {
 
 ResetPosition(*) {
     global zone, CFG, isPinned
-    isPinned := true
-    ; Will snap to editor on next TrackEditorWindow tick
+    zone.Move((A_ScreenWidth - CFG.zoneW) // 2, (A_ScreenHeight - CFG.zoneH) // 2)
+    isPinned := false
     SaveSettings()
 }
 
@@ -686,81 +608,32 @@ ResetSize(*) {
     SaveSettings()
 }
 
-; ============================================================================
-; Track editor window — keep pill pinned relative to editor window
-; ============================================================================
-RecalcPinOffset() {
-    global zone, CFG, pinOffsetX, pinOffsetY
-
-    ; Find editor window
-    editorHwnd := FindEditorHwnd()
-    if (!editorHwnd)
-        return
-
-    try {
-        WinGetPos(&ex, &ey, &ew, &eh, editorHwnd)
-        zone.GetPos(&zx, &zy)
-        ; Store offset from editor's bottom-right corner
-        pinOffsetX := zx - (ex + ew)
-        pinOffsetY := zy - (ey + eh)
-        Log("Pin offset updated: " pinOffsetX ", " pinOffsetY)
-    }
-}
-
-FindEditorHwnd() {
-    for ed in EDITORS {
-        try {
-            h := WinExist("ahk_exe " ed.exe)
-            if (h)
-                return h
+CenterOnScreen(*) {
+    global zone, CFG, isPinned
+    ; Get the monitor the mouse is currently on
+    CoordMode("Mouse", "Screen")
+    MouseGetPos(&mx, &my)
+    MonitorCount := MonitorGetCount()
+    Loop MonitorCount {
+        MonitorGet(A_Index, &L, &T, &R, &B)
+        if (mx >= L && mx < R && my >= T && my < B) {
+            cx := L + (R - L - CFG.zoneW) // 2
+            cy := T + (B - T - CFG.zoneH) // 2
+            zone.Move(cx, cy)
+            isPinned := false
+            SaveSettings()
+            Log("Centered on monitor " A_Index)
+            return
         }
     }
-    return 0
-}
-
-TrackEditorWindow() {
-    global zone, CFG, isPinned, isBusy, isResizing, isDragging, isHovering
-    global pinOffsetX, pinOffsetY
-
-    if (!isPinned || isBusy || isResizing || isDragging || isHovering)
-        return
-
-    ; Don't move the pill while user is dragging anything (mouse button held)
-    if (GetKeyState("LButton", "P"))
-        return
-
-    editorHwnd := FindEditorHwnd()
-    if (!editorHwnd)
-        return
-
-    try {
-        WinGetPos(&ex, &ey, &ew, &eh, editorHwnd)
-    } catch {
-        return
-    }
-
-    ; Skip if editor is minimized
-    if (ew <= 0 || eh <= 0)
-        return
-
-    ; Position relative to editor's bottom-right corner + saved offset
-    ; No screen clamping — works across any monitor setup
-    targetX := ex + ew + pinOffsetX
-    targetY := ey + eh + pinOffsetY
-
-    ; Only move if position actually changed by more than 1px
-    ; (prevents jitter from editor redraws during file drag-over)
-    try {
-        zone.GetPos(&cx, &cy)
-        if (Abs(cx - targetX) <= 1 && Abs(cy - targetY) <= 1)
-            return
-    }
-
-    zone.Move(targetX, targetY)
+    ; Fallback to primary
+    zone.Move((A_ScreenWidth - CFG.zoneW) // 2, (A_ScreenHeight - CFG.zoneH) // 2)
+    isPinned := false
+    SaveSettings()
 }
 
 ; ============================================================================
-; Drag-hover detection
+; Hover detection
 ; ============================================================================
 CheckDragHover() {
     global isHovering, isBusy, isResizing, isDragging, zone, CFG, COLORS
@@ -805,7 +678,74 @@ CheckDragHover() {
 }
 
 ; ============================================================================
-; Ctrl+V — paste clipboard (native Win32 API, no PowerShell)
+; Pin to editor
+; ============================================================================
+RecalcPinOffset() {
+    global zone, CFG, pinOffsetX, pinOffsetY
+
+    editorHwnd := FindEditorHwnd()
+    if (!editorHwnd)
+        return
+
+    try {
+        WinGetPos(&ex, &ey, &ew, &eh, editorHwnd)
+        zone.GetPos(&zx, &zy)
+        pinOffsetX := zx - (ex + ew)
+        pinOffsetY := zy - (ey + eh)
+        Log("Pin offset updated: " pinOffsetX ", " pinOffsetY)
+    }
+}
+
+FindEditorHwnd() {
+    for ed in EDITORS {
+        try {
+            h := WinExist("ahk_exe " ed.exe)
+            if (h)
+                return h
+        }
+    }
+    return 0
+}
+
+TrackEditorWindow() {
+    global zone, CFG, isPinned, isBusy, isResizing, isDragging, isHovering
+    global pinOffsetX, pinOffsetY
+
+    if (!isPinned || isBusy || isResizing || isDragging || isHovering)
+        return
+
+    if (GetKeyState("LButton", "P"))
+        return
+
+    editorHwnd := FindEditorHwnd()
+    if (!editorHwnd)
+        return
+
+    try {
+        WinGetPos(&ex, &ey, &ew, &eh, editorHwnd)
+    } catch {
+        return
+    }
+
+    if (ew <= 0 || eh <= 0)
+        return
+
+    targetX := ex + ew + pinOffsetX
+    targetY := ey + eh + pinOffsetY
+
+    try {
+        zone.GetPos(&cx, &cy)
+        if (Abs(cx - targetX) <= 1 && Abs(cy - targetY) <= 1)
+            return
+    }
+
+    zone.Move(targetX, targetY)
+    ; Re-assert topmost so we stay above Cursor
+    DllCall("SetWindowPos", "Ptr", zone.Hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0003)
+}
+
+; ============================================================================
+; Clipboard paste
 ; ============================================================================
 PasteClipboard(*) {
     global CFG
@@ -815,19 +755,14 @@ PasteClipboard(*) {
     timestamp := FormatTime(, "yyyyMMdd-HHmmss")
     filesToUpload := []
 
-    ; Open clipboard
-    if (!DllCall("OpenClipboard", "Ptr", 0)) {
+    if (!DllCall("OpenClipboard", "Ptr", 0, "Int")) {
         SetState("error", "Clipboard locked")
-        Log("Failed to open clipboard")
         return
     }
 
-    ; Check for file drop list first (CF_HDROP = 15)
     hDrop := DllCall("GetClipboardData", "UInt", 15, "Ptr")
     if (hDrop) {
-        Log("CF_HDROP found")
         fileCount := DllCall("shell32\DragQueryFileW", "Ptr", hDrop, "UInt", 0xFFFFFFFF, "Ptr", 0, "UInt", 0)
-        Log("CF_HDROP file count: " fileCount)
         Loop fileCount {
             i := A_Index - 1
             size := DllCall("shell32\DragQueryFileW", "Ptr", hDrop, "UInt", i, "Ptr", 0, "UInt", 0) + 1
@@ -837,25 +772,17 @@ PasteClipboard(*) {
             if (FileExist(fpath)) {
                 filesToUpload.Push(fpath)
                 Log("Clipboard file: " fpath)
-            } else {
-                Log("Clipboard file NOT FOUND: " fpath)
             }
         }
-    } else {
-        Log("No CF_HDROP on clipboard")
     }
 
-    ; Check for bitmap (CF_BITMAP = 2, CF_DIB = 8, CF_DIBV5 = 17)
     hasBitmap := DllCall("IsClipboardFormatAvailable", "UInt", 2)
               || DllCall("IsClipboardFormatAvailable", "UInt", 8)
               || DllCall("IsClipboardFormatAvailable", "UInt", 17)
 
-    ; ALWAYS close clipboard before doing anything else
     DllCall("CloseClipboard")
 
-    ; Route 1: Files found — instant path, no PowerShell
     if (filesToUpload.Length > 0) {
-        Log("Using file route (instant)")
         ctx := FindEditorContext()
         if (!ctx.alias || !ctx.workspace) {
             SetState("error", "No SSH session")
@@ -865,13 +792,10 @@ PasteClipboard(*) {
         return
     }
 
-    ; Route 2: Bitmap — save via native GDI+ (no PowerShell)
     if (hasBitmap) {
-        Log("Using bitmap route (native GDI+)")
         outFile := CFG.clipDir . "\clip-" . timestamp . ".png"
-
         if (SaveClipboardBitmapGDI(outFile)) {
-            Log("Bitmap saved (native): " outFile)
+            Log("Bitmap saved: " outFile)
             ctx := FindEditorContext()
             if (!ctx.alias || !ctx.workspace) {
                 SetState("error", "No SSH session")
@@ -880,14 +804,11 @@ PasteClipboard(*) {
             ProcessDrops([outFile], ctx)
         } else {
             SetState("error", "Bitmap save failed")
-            Log("Native GDI+ save failed")
         }
         return
     }
 
-    ; Nothing useful on clipboard
     SetState("error", "Empty clipboard")
-    Log("Nothing on clipboard")
 }
 
 RunCmdCapture(cmd) {
@@ -901,7 +822,72 @@ RunCmdCapture(cmd) {
 }
 
 ; ============================================================================
-; WM_DROPFILES — files dragged from Explorer
+; GDI+ bitmap save
+; ============================================================================
+SaveClipboardBitmapGDI(outFile) {
+    hGdiplus := DllCall("LoadLibrary", "Str", "gdiplus", "Ptr")
+    if (!hGdiplus) {
+        Log("GDI+: LoadLibrary failed")
+        return false
+    }
+
+    gdipToken := 0
+    si := Buffer(24, 0)
+    NumPut("UInt", 1, si, 0)
+    result := DllCall("gdiplus\GdiplusStartup", "Ptr*", &gdipToken, "Ptr", si, "Ptr", 0, "Int")
+    if (result != 0) {
+        DllCall("FreeLibrary", "Ptr", hGdiplus)
+        return false
+    }
+
+    if (!DllCall("OpenClipboard", "Ptr", 0, "Int")) {
+        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
+        DllCall("FreeLibrary", "Ptr", hGdiplus)
+        return false
+    }
+
+    hBitmap := DllCall("GetClipboardData", "UInt", 2, "Ptr")
+    if (!hBitmap) {
+        DllCall("CloseClipboard")
+        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
+        DllCall("FreeLibrary", "Ptr", hGdiplus)
+        return false
+    }
+
+    pBitmap := 0
+    result := DllCall("gdiplus\GdipCreateBitmapFromHBITMAP", "Ptr", hBitmap, "Ptr", 0, "Ptr*", &pBitmap, "Int")
+    DllCall("CloseClipboard")
+
+    if (result != 0 || !pBitmap) {
+        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
+        DllCall("FreeLibrary", "Ptr", hGdiplus)
+        return false
+    }
+
+    pngClsid := Buffer(16)
+    NumPut("UInt", 0x557CF406, pngClsid, 0)
+    NumPut("UShort", 0x1A04, pngClsid, 4)
+    NumPut("UShort", 0x11D3, pngClsid, 6)
+    NumPut("UChar", 0x9A, pngClsid, 8)
+    NumPut("UChar", 0x73, pngClsid, 9)
+    NumPut("UChar", 0x00, pngClsid, 10)
+    NumPut("UChar", 0x00, pngClsid, 11)
+    NumPut("UChar", 0xF8, pngClsid, 12)
+    NumPut("UChar", 0x1E, pngClsid, 13)
+    NumPut("UChar", 0xF3, pngClsid, 14)
+    NumPut("UChar", 0x2E, pngClsid, 15)
+
+    result := DllCall("gdiplus\GdipSaveImageToFile", "Ptr", pBitmap, "WStr", outFile, "Ptr", pngClsid, "Ptr", 0, "Int")
+
+    DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
+    DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
+    DllCall("FreeLibrary", "Ptr", hGdiplus)
+
+    return (result = 0)
+}
+
+; ============================================================================
+; File drop handler
 ; ============================================================================
 HandleDrop(wParam, lParam, msg, hwnd) {
     global zone
@@ -938,7 +924,7 @@ HandleDrop(wParam, lParam, msg, hwnd) {
 }
 
 ; ============================================================================
-; Find editor SSH context
+; Editor context
 ; ============================================================================
 FindEditorContext() {
     info := { alias: "", workspace: "", appData: "" }
@@ -986,9 +972,6 @@ FindEditorContext() {
     return info
 }
 
-; ============================================================================
-; Resolve remote workspace from editor storage
-; ============================================================================
 GetEditorRemoteWorkspace(alias, appDataFolder) {
     if (!alias)
         return ""
@@ -1018,14 +1001,12 @@ GetEditorRemoteWorkspace(alias, appDataFolder) {
     Log("Reading: " foundPath)
     lastMatch := ""
 
-    ; Format B: hex-encoded JSON (newer Cursor)
     jsonStr := '{"hostName":"' . alias . '"}'
     hexStr := ""
     Loop Parse, jsonStr
         hexStr .= Format("{:02x}", Ord(A_LoopField))
 
     needleB := "vscode-remote://ssh-remote%2B" . hexStr
-    Log("Trying format B: " needleB)
     pos := 1
     while (pos := InStr(content, needleB, false, pos + 1)) {
         endPos := InStr(content, '"', false, pos)
@@ -1042,9 +1023,7 @@ GetEditorRemoteWorkspace(alias, appDataFolder) {
         return path
     }
 
-    ; Format A: plain alias (VS Code)
     needleA := "vscode-remote://ssh-remote+" . alias
-    Log("Trying format A: " needleA)
     pos := 1
     while (pos := InStr(content, needleA, false, pos + 1)) {
         endPos := InStr(content, '"', false, pos)
@@ -1077,7 +1056,7 @@ UrlDecode(s) {
 }
 
 ; ============================================================================
-; Video → frames conversion (ffmpeg)
+; Video
 ; ============================================================================
 IsVideoFile(filePath) {
     global CFG
@@ -1099,13 +1078,9 @@ ExtractVideoFrames(videoPath) {
     if (!HasFFmpeg()) {
         result := MsgBox(
             "FFmpeg is required to extract frames from videos.`n`n"
-            . "Install it with:`n"
-            . "  winget install ffmpeg`n`n"
-            . "Or download from https://ffmpeg.org/download.html`n"
-            . "and add it to your PATH.`n`n"
+            . "Install it with:`n  winget install ffmpeg`n`n"
             . "Open the download page?",
-            "CursorDrop — FFmpeg required",
-            "YesNo Icon!"
+            "CursorDrop — FFmpeg required", "YesNo Icon!"
         )
         if (result = "Yes")
             Run("https://ffmpeg.org/download.html")
@@ -1113,46 +1088,34 @@ ExtractVideoFrames(videoPath) {
     }
 
     SplitPath(videoPath, &fname, , &ext)
-    timestamp := FormatTime(, "yyyyMMdd-HHmmss")
-    frameDir := CFG.clipDir . "\frames-" . timestamp
+    ts := FormatTime(, "yyyyMMdd-HHmmss")
+    frameDir := CFG.clipDir . "\frames-" . ts
     DirCreate(frameDir)
 
-    ; Copy video to temp with a clean ASCII filename
-    ; (WhatsApp and macOS use non-breaking spaces and Unicode chars in filenames
-    ;  which break batch files / ffmpeg path handling)
-    tempVideo := CFG.clipDir . "\tempvideo-" . timestamp . "." . ext
+    tempVideo := CFG.clipDir . "\tempvideo-" . ts . "." . ext
     try {
         FileCopy(videoPath, tempVideo, true)
-        Log("Copied video to clean path: " tempVideo)
     } catch as e {
         Log("Failed to copy video: " e.Message)
         SetState("error", "Copy failed")
         return []
     }
 
-    ; Get video duration via ffprobe
     tmpFile := A_Temp . "\cursordrop_duration.txt"
     try FileDelete(tmpFile)
-
     RunWait(A_ComSpec . ' /c ffprobe -v error -show_entries format=duration -of csv=p=0 "' . tempVideo . '" > "' . tmpFile . '" 2>&1', , "Hide")
 
-    ; Log what ffprobe returned
     probeOutput := ""
     try probeOutput := Trim(FileRead(tmpFile, "UTF-8"))
-    Log("ffprobe output: [" probeOutput "]")
 
-    ; Strip any non-numeric characters (BOM, whitespace, etc)
     cleanDuration := RegExReplace(probeOutput, "[^\d.]", "")
-    Log("Clean duration string: [" cleanDuration "]")
-
     duration := 0
     if (cleanDuration != "")
         try duration := Float(cleanDuration)
 
-    Log("Parsed duration: " duration)
-
     if (duration <= 0) {
         Log("Could not get video duration: " videoPath)
+        try FileDelete(tempVideo)
         SetState("error", "Bad video")
         return []
     }
@@ -1163,31 +1126,26 @@ ExtractVideoFrames(videoPath) {
         result := MsgBox(
             "Video is " . Round(duration) . "s long.`n"
             . "Only the first " . CFG.videoMaxSec . "s will be extracted.`n`nContinue?",
-            "CursorDrop",
-            "YesNo Icon!"
+            "CursorDrop", "YesNo Icon!"
         )
-        if (result != "Yes")
+        if (result != "Yes") {
+            try FileDelete(tempVideo)
             return []
+        }
     }
 
     expectedFrames := Ceil(clipDuration * CFG.videoFPS)
-
-    ; Hard cap at 60 frames — protect against accidental 4fps × 30s = 120 frames
     if (expectedFrames > 60) {
         clipDuration := Floor(60 / CFG.videoFPS)
         expectedFrames := 60
-        Log("Capped to 60 frames (" clipDuration "s at " CFG.videoFPS " fps)")
     }
 
     SetState("uploading", "Extracting " . expectedFrames . " frames...")
     Log("Extracting: " fname " (" . Round(duration, 1) . "s → " . expectedFrames . " frames)")
 
-    ; Extract frames using the clean temp copy
     ffmpegCmd := 'ffmpeg -i "' . tempVideo . '" -t ' . clipDuration . ' -vf "fps=' . CFG.videoFPS . '" -q:v 2 "' . frameDir . '\frame_%03d.jpg" -y'
-    Log("Run: " ffmpegCmd)
     RunWait(A_ComSpec . ' /c ' . ffmpegCmd . ' > nul 2>&1', , "Hide")
 
-    ; Clean up temp video copy
     try FileDelete(tempVideo)
 
     frames := []
@@ -1207,16 +1165,7 @@ ExtractVideoFrames(videoPath) {
 }
 
 ; ============================================================================
-; Upload files via SCP → instant path paste with background upload
-;
-; Flow:
-;   1. Pre-process: convert any videos to frames
-;   2. Build remote filenames locally (zero network, instant)
-;   3. Paste paths into terminal IMMEDIATELY — before any SSH call
-;   4. ssh mkdir -p + touch placeholders (single call, background)
-;   5. scp real files (background, overwrites placeholders)
-;
-; The path appears in Claude Code before anything hits the network.
+; Upload — instant paste, background SCP
 ; ============================================================================
 ProcessDrops(files, ctx) {
     global CFG
@@ -1235,9 +1184,9 @@ ProcessDrops(files, ctx) {
             regularFiles.Push(localPath)
     }
 
-    ; Process videos first — each gets its own remote subfolder
-    videoPaths := []    ; remote folder paths to paste
-    videoDirMap := []   ; { localDir, remoteDir } for batch SCP
+    ; Process videos
+    videoPaths := []
+    videoDirMaps := []
 
     for _, videoPath in videoFiles {
         frames := ExtractVideoFrames(videoPath)
@@ -1248,16 +1197,17 @@ ProcessDrops(files, ctx) {
         tempFrameDirs.Push(localFrameDir)
 
         SplitPath(videoPath, &vname, , &vext)
-        timestamp := FormatTime(, "yyyyMMdd-HHmmss")
-        folderName := timestamp . "-" . SanitizeFilename(StrReplace(vname, "." . vext, "")) . "-frames"
-        remoteVideoDir := ctx.workspace . "/" . CFG.remoteSubdir . "/" . folderName
+        ts := FormatTime(, "yyyyMMdd-HHmmss")
+        folderName := ts . "-" . SanitizeFilename(StrReplace(vname, "." . vext, "")) . "-frames"
+        remoteBase := ctx.workspace . "/" . CFG.remoteSubdir
+        remoteVideoDir := remoteBase . "/" . folderName
         remoteVideoDir := StrReplace(remoteVideoDir, "//", "/")
 
         videoPaths.Push(remoteVideoDir)
-        videoDirMap.Push({ localDir: localFrameDir, remoteDir: remoteVideoDir, count: frames.Length })
+        videoDirMaps.Push({ localDir: localFrameDir, remoteDir: remoteVideoDir, count: frames.Length })
     }
 
-    ; Build full list of paths to paste (video folders + regular file paths)
+    ; Regular files
     remoteDir := ctx.workspace . "/" . CFG.remoteSubdir
     remoteDir := StrReplace(remoteDir, "//", "/")
 
@@ -1266,14 +1216,12 @@ ProcessDrops(files, ctx) {
     touchParts := ""
 
     for _, localPath in regularFiles {
-        if (!FileExist(localPath)) {
-            Log("Skip: " localPath)
+        if (!FileExist(localPath))
             continue
-        }
 
         SplitPath(localPath, &fname)
-        timestamp := FormatTime(, "yyyyMMdd-HHmmss")
-        remoteName := timestamp . "-" . SanitizeFilename(fname)
+        ts := FormatTime(, "yyyyMMdd-HHmmss")
+        remoteName := ts . "-" . SanitizeFilename(fname)
         remotePath := remoteDir . "/" . remoteName
 
         remoteFiles.Push(remotePath)
@@ -1286,14 +1234,14 @@ ProcessDrops(files, ctx) {
         return
     }
 
-    ; Build payload — video folder paths + regular file paths
+    ; Build payload
     payload := ""
     for _, vp in videoPaths
         payload .= (payload ? " " : "") . "'" . vp . "/'"
     for _, p in remoteFiles
         payload .= (payload ? " " : "") . "'" . p . "'"
 
-    ; Paste IMMEDIATELY — before any SSH call
+    ; PASTE IMMEDIATELY
     A_Clipboard := payload
 
     pasted := false
@@ -1310,51 +1258,40 @@ ProcessDrops(files, ctx) {
         }
     }
 
-    if (!pasted) {
-        Log("Auto-paste failed. Path on clipboard.")
+    if (!pasted)
         Notify("Path copied — Ctrl+V in Claude Code.", false)
-    }
 
-    ; Background: create remote dirs + placeholders
+    ; Background: mkdir + touch + scp
     videoFrameCount := 0
-    for _, vd in videoDirMap
+    for _, vd in videoDirMaps
         videoFrameCount += vd.count
-    totalFiles := remoteFiles.Length + videoDirMap.Length
+    totalFiles := remoteFiles.Length + videoDirMaps.Length
     SetState("uploading", "Syncing...")
 
-    ; Build mkdir commands for all needed directories
     mkdirParts := ShellQuote(remoteDir)
     for _, vp in videoPaths
         mkdirParts .= " " . ShellQuote(vp)
 
-    mkCmd := Format('ssh -o ConnectTimeout={1} {2} "mkdir -p {3}"',
-        CFG.sshTimeout, ctx.alias, mkdirParts)
-
-    ; Add touch for regular files
+    mkCmd := "ssh -o ConnectTimeout=" . CFG.sshTimeout . " " . ctx.alias . ' "mkdir -p ' . mkdirParts . '"'
     if (touchParts != "")
-        mkCmd := Format('ssh -o ConnectTimeout={1} {2} "mkdir -p {3} && touch{4}"',
-            CFG.sshTimeout, ctx.alias, mkdirParts, touchParts)
+        mkCmd := "ssh -o ConnectTimeout=" . CFG.sshTimeout . " " . ctx.alias . ' "mkdir -p ' . mkdirParts . " && touch" . touchParts . '"'
 
     Log("Run: " mkCmd)
     if (!RunCommand(mkCmd, &stderr)) {
         SetState("error", "Remote prep failed")
-        Log("FAIL mkdir: " stderr)
         return
     }
 
-    ; SCP regular files
     failCount := 0
     uploaded := 0
+
     for i, localPath in localFiles {
         uploaded++
         SplitPath(localPath, &fname)
         SetState("uploading", "Syncing " . uploaded . "/" . totalFiles . " " . fname)
 
         scpCmd := Format('scp -o ConnectTimeout={1} {2} {3}:{4}',
-            CFG.sshTimeout,
-            ShellQuote(localPath),
-            ctx.alias,
-            ShellQuote(remoteFiles[i]))
+            CFG.sshTimeout, ShellQuote(localPath), ctx.alias, ShellQuote(remoteFiles[i]))
         Log("Run: " scpCmd)
 
         if (!RunCommand(scpCmd, &stderr)) {
@@ -1365,17 +1302,12 @@ ProcessDrops(files, ctx) {
         }
     }
 
-    ; SCP video frame directories (one scp call per video — all frames at once)
-    for _, vd in videoDirMap {
+    for _, vd in videoDirMaps {
         uploaded++
         SetState("uploading", "Syncing " . uploaded . "/" . totalFiles . " (" . vd.count . " frames)")
 
-        ; scp all jpgs in the local frame dir to the remote dir in one shot
         scpCmd := Format('scp -o ConnectTimeout={1} {2}\*.jpg {3}:{4}/',
-            CFG.sshTimeout,
-            ShellQuote(vd.localDir),
-            ctx.alias,
-            ShellQuote(vd.remoteDir))
+            CFG.sshTimeout, ShellQuote(vd.localDir), ctx.alias, ShellQuote(vd.remoteDir))
         Log("Run: " scpCmd)
 
         if (!RunCommand(scpCmd, &stderr)) {
@@ -1386,19 +1318,16 @@ ProcessDrops(files, ctx) {
         }
     }
 
-    if (failCount > 0) {
+    if (failCount > 0)
         SetState("error", failCount . " upload(s) failed")
-    } else {
+    else
         SetState("success", totalFiles . " file" . (totalFiles > 1 ? "s" : "") . " ready")
-    }
 
-    ; Clean up temp frame directories
     for _, dir in tempFrameDirs {
         try {
             Loop Files, dir . "\*.*"
                 FileDelete(A_LoopFileFullPath)
             DirDelete(dir)
-            Log("Cleaned temp frames: " dir)
         }
     }
 }
@@ -1419,7 +1348,6 @@ CleanRemoteFiles(*) {
     SetState("uploading", "Counting...")
     countCmd := Format('ssh -o ConnectTimeout={1} {2} "ls -1 {3} 2>/dev/null | wc -l"',
         CFG.sshTimeout, ctx.alias, ShellQuote(remoteDir))
-    Log("Count: " countCmd)
 
     if (!RunCommand(countCmd, &stderr)) {
         SetState("error", "Count failed")
@@ -1439,8 +1367,7 @@ CleanRemoteFiles(*) {
 
     result := MsgBox(
         Format("Delete all {1} file(s) in:`n{2}:{3}`n`nThis cannot be undone.", count, ctx.alias, remoteDir),
-        "Clean remote .cursor-drop-files?",
-        "YesNo Icon! Default2"
+        "Clean remote .cursor-drop-files?", "YesNo Icon! Default2"
     )
 
     if (result != "Yes") {
@@ -1451,14 +1378,12 @@ CleanRemoteFiles(*) {
     SetState("uploading", "Deleting...")
     cleanCmd := Format('ssh -o ConnectTimeout={1} {2} "rm -rf {3}/*"',
         CFG.sshTimeout, ctx.alias, ShellQuote(remoteDir))
-    Log("Clean: " cleanCmd)
 
     if (RunCommand(cleanCmd, &stderr)) {
         SetState("success", count . " deleted")
         Log("Remote cleanup: " count " files deleted")
     } else {
         SetState("error", "Clean failed")
-        Log("Remote cleanup failed: " stderr)
     }
 }
 
@@ -1474,13 +1399,10 @@ CleanLocalTemp(*) {
         }
     }
     SetState("success", count . " temp cleared")
-    Log("Local cleanup: " count " files")
 }
 
 ; ============================================================================
-; Watch folder — auto-upload files dropped into ~/CursorDrop/
-; Works with LocalSend, manual file copies, or any other source.
-; Files are uploaded then deleted from the watch folder.
+; Watch folder
 ; ============================================================================
 ScanWatchFolder() {
     global CFG, watchKnownFiles
@@ -1507,17 +1429,13 @@ CheckWatchFolder() {
             if (A_LoopFileName = "desktop.ini" || A_LoopFileName = ".DS_Store")
                 continue
             if (!watchKnownFiles.Has(A_LoopFileFullPath)) {
-                ; Check file size stability — wait for writes to finish
-                ; (LocalSend might still be writing)
                 size1 := A_LoopFileSize
                 Sleep(200)
                 try {
                     if (FileExist(A_LoopFileFullPath)) {
                         size2 := FileGetSize(A_LoopFileFullPath)
-                        if (size1 = size2 && size2 > 0) {
+                        if (size1 = size2 && size2 > 0)
                             newFiles.Push(A_LoopFileFullPath)
-                        }
-                        ; else still being written — will catch on next tick
                     }
                 }
             }
@@ -1527,117 +1445,27 @@ CheckWatchFolder() {
     if (newFiles.Length = 0)
         return
 
-    ; Mark as known immediately to prevent re-processing
     for _, f in newFiles
         watchKnownFiles[f] := true
 
     Log("Watch folder: " newFiles.Length " new file(s)")
 
-    ; Find editor context
     ctx := FindEditorContext()
     if (!ctx.alias || !ctx.workspace) {
         SetState("error", "No SSH session")
-        Log("Watch folder: no SSH context")
         return
     }
 
-    ; Upload using the same instant-paste flow
     ProcessDrops(newFiles, ctx)
 
-    ; Delete local copies after successful upload
     for _, f in newFiles {
         try {
             if (FileExist(f)) {
                 FileDelete(f)
                 watchKnownFiles.Delete(f)
-                Log("Watch folder: cleaned " f)
             }
         }
     }
-}
-
-; ============================================================================
-; Native GDI+ bitmap save — no PowerShell, instant
-; ============================================================================
-SaveClipboardBitmapGDI(outFile) {
-    ; Load GDI+ DLL explicitly
-    hGdiplus := DllCall("LoadLibrary", "Str", "gdiplus", "Ptr")
-    if (!hGdiplus) {
-        Log("GDI+: LoadLibrary failed")
-        return false
-    }
-
-    ; Initialize GDI+
-    gdipToken := 0
-    si := Buffer(24, 0)              ; GdiplusStartupInput
-    NumPut("UInt", 1, si, 0)         ; GdiplusVersion = 1
-    result := DllCall("gdiplus\GdiplusStartup", "Ptr*", &gdipToken, "Ptr", si, "Ptr", 0, "Int")
-    if (result != 0) {
-        Log("GDI+ startup failed: " result)
-        DllCall("FreeLibrary", "Ptr", hGdiplus)
-        return false
-    }
-
-    success := false
-
-    ; Open clipboard and get CF_BITMAP
-    if (!DllCall("OpenClipboard", "Ptr", 0, "Int")) {
-        Log("GDI+: clipboard open failed")
-        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
-        DllCall("FreeLibrary", "Ptr", hGdiplus)
-        return false
-    }
-
-    hBitmap := DllCall("GetClipboardData", "UInt", 2, "Ptr")  ; CF_BITMAP = 2
-    if (!hBitmap) {
-        DllCall("CloseClipboard")
-        Log("GDI+: no CF_BITMAP")
-        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
-        DllCall("FreeLibrary", "Ptr", hGdiplus)
-        return false
-    }
-
-    ; Create GDI+ Bitmap from HBITMAP
-    pBitmap := 0
-    result := DllCall("gdiplus\GdipCreateBitmapFromHBITMAP", "Ptr", hBitmap, "Ptr", 0, "Ptr*", &pBitmap, "Int")
-    DllCall("CloseClipboard")
-
-    if (result != 0 || !pBitmap) {
-        Log("GDI+ bitmap create failed: " result)
-        DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
-        DllCall("FreeLibrary", "Ptr", hGdiplus)
-        return false
-    }
-
-    ; PNG encoder CLSID: {557CF406-1A04-11D3-9A73-0000F81EF32E}
-    pngClsid := Buffer(16)
-    NumPut("UInt", 0x557CF406, pngClsid, 0)
-    NumPut("UShort", 0x1A04, pngClsid, 4)
-    NumPut("UShort", 0x11D3, pngClsid, 6)
-    NumPut("UChar", 0x9A, pngClsid, 8)
-    NumPut("UChar", 0x73, pngClsid, 9)
-    NumPut("UChar", 0x00, pngClsid, 10)
-    NumPut("UChar", 0x00, pngClsid, 11)
-    NumPut("UChar", 0xF8, pngClsid, 12)
-    NumPut("UChar", 0x1E, pngClsid, 13)
-    NumPut("UChar", 0xF3, pngClsid, 14)
-    NumPut("UChar", 0x2E, pngClsid, 15)
-
-    ; Save to file
-    result := DllCall("gdiplus\GdipSaveImageToFile", "Ptr", pBitmap, "WStr", outFile, "Ptr", pngClsid, "Ptr", 0, "Int")
-
-    ; Cleanup
-    DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
-    DllCall("gdiplus\GdiplusShutdown", "Ptr", gdipToken)
-    DllCall("FreeLibrary", "Ptr", hGdiplus)
-
-    if (result != 0) {
-        Log("GDI+ save failed: " result)
-        return false
-    }
-
-    success := true
-    return success
 }
 
 ; ============================================================================
