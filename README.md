@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/27294477/README.md)
 # CursorDrop
 
 Drag files or paste screenshots into a floating widget — they're instantly uploaded to your remote SSH server and the path appears in your Claude Code terminal. Zero friction.
@@ -33,6 +32,7 @@ That's it.
 - AutoHotkey v2
 - SSH key auth configured — `scp yourhost:/path` must work without a password prompt
 - Cursor or VS Code connected to a remote server via Remote-SSH
+- [FFmpeg](https://ffmpeg.org/) (optional — only needed for video frame extraction)
 
 ## Usage
 
@@ -46,9 +46,47 @@ That's it.
 - Pin/unpin to editor window
 - Switch dark/light theme
 - Resize presets
+- Video frame rate presets
 - Open watch folder
 - Clean all remote files (with confirmation)
 - Show log
+
+## Video Support
+
+Drop a video file onto CursorDrop and it extracts frames using FFmpeg, uploads them as a folder, and pastes the folder path. Claude can read the frames to understand what happened on screen — great for screen recordings of bugs.
+
+**Supported formats:** mp4, mov, webm, avi, mkv, wmv
+
+**Frame rate presets (right-click → Video frame rate):**
+- 0.5 fps — 1 frame every 2 seconds, for long recordings
+- 1 fps — default, good for most screen recordings
+- 2 fps — more detail, for faster interactions
+- 4 fps — animations and quick UI transitions
+
+Videos longer than 30 seconds are clipped. Hard cap of 60 frames to prevent accidents.
+
+**Install FFmpeg:** `winget install ffmpeg` in PowerShell, or download from [ffmpeg.org](https://ffmpeg.org/download.html). CursorDrop will prompt you if it's missing when you drop a video.
+
+**Remote structure:**
+```
+.cursor-drop-files/
+├── 20260501-screenshot.png
+└── 20260501-bug-recording-frames/
+    ├── frame_001.jpg
+    ├── frame_002.jpg
+    └── ...
+```
+
+## Watch Folder & LocalSend
+
+CursorDrop watches `%USERPROFILE%\CursorDrop\` for new files. Anything dropped in that folder is automatically uploaded to the remote server, the path is pasted into your terminal, and the local copy is deleted.
+
+This works with any app, but it's especially useful with [LocalSend](https://localsend.org/):
+
+1. Install LocalSend on your PC and phone
+2. In LocalSend settings on PC, set the save directory to `%USERPROFILE%\CursorDrop`
+3. Enable Quick Save
+4. Send a file from your phone — the path appears in Claude Code automatically
 
 ## Features
 
@@ -56,7 +94,7 @@ That's it.
 - Drag the pill while pinned to set a custom offset
 - Dark and light mode (auto-detects Windows theme, or toggle manually)
 - Resizable — drag edges or pick a preset
-- Remembers size, position, pin offset, and theme across restarts
+- Remembers size, position, pin offset, theme, and video FPS across restarts
 - Remote files go into `.cursor-drop-files/` under your workspace root
 - Cleanup counts files and asks for confirmation before deleting
 - Full log file for debugging
@@ -68,7 +106,9 @@ That's it.
 3. The path is pasted into your terminal immediately
 4. In the background: `ssh mkdir -p && touch` creates a placeholder, then `scp` uploads the real file
 
-Screenshots are saved via native GDI+ DllCalls — no PowerShell process spawn.
+For videos: frames are extracted locally with FFmpeg, then uploaded as a folder in a single `scp` call.
+
+For screenshots: saved via native GDI+ DllCalls — no PowerShell process spawn.
 
 ## Supported Editors
 
@@ -87,15 +127,8 @@ Edit the config block at the top of `CursorDrop.ahk`:
 | `remoteSubdir` | `.cursor-drop-files` | Folder created under your remote workspace root |
 | `sshTimeout` | `30` | SSH/SCP timeout in seconds |
 | `watchDir` | `%USERPROFILE%\CursorDrop` | Local folder watched for new files |
-
-## LocalSend Integration
-
-To send files from your phone directly into Claude Code:
-
-1. Install [LocalSend](https://localsend.org/) on your PC and phone
-2. In LocalSend settings on PC, set the save directory to `%USERPROFILE%\CursorDrop`
-3. Enable Quick Save
-4. Send a file from your phone — the path appears in Claude Code automatically
+| `videoFPS` | `1` | Frames per second for video extraction |
+| `videoMaxSec` | `30` | Max video duration to process |
 
 ## License
 
