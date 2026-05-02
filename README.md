@@ -1,4 +1,4 @@
-[README (2).md](https://github.com/user-attachments/files/27297154/README.2.md)
+[README (3).md](https://github.com/user-attachments/files/27297925/README.3.md)
 # CursorDrop
 
 Drag files or paste screenshots into a floating widget — they're instantly uploaded to your remote SSH server and the path appears in your Claude Code terminal. Zero friction.
@@ -31,9 +31,11 @@ The path is pasted into your terminal before any network call happens. By the ti
 
 1. Download and unzip `CursorDrop-macOS.zip`
 2. Run `bash install.sh`
-3. Grant Accessibility access when prompted (or go to Settings -> Prviacy & Security -> Accessibility and press the "+" and find CursorDrop in Applications and add it, then toggle it on.
+3. Grant permissions when prompted:
+   - **Accessibility** — System Settings → Privacy & Security → Accessibility → add CursorDrop → toggle ON
+   - **Input Monitoring** — System Settings → Privacy & Security → Input Monitoring → add CursorDrop → toggle ON
 
-Requires Xcode command line tools (the install script will prompt if missing). No other dependencies.
+The installer opens System Settings automatically. Requires Xcode command line tools (the install script will prompt if missing). No other dependencies.
 
 ## Requirements
 
