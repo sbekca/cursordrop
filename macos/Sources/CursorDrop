@@ -1,0 +1,1073 @@
+import Cocoa
+import Foundation
+import UniformTypeIdentifiers
+
+// MARK: - Config
+struct Config {
+    static var remoteSubdir = ".cursor-drop-files"
+    static var sshTimeout = 30
+    static var videoFPS: Double = 1.0
+    static var videoMaxSec = 30
+    static var maxFrames = 60
+    static let videoExts: Set<String> = ["mp4", "mov", "webm", "avi", "mkv", "wmv"]
+    static let watchDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("CursorDrop")
+    static let clipDir = FileManager.default.temporaryDirectory.appendingPathComponent("CursorDrop_clips")
+    static let settingsPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/cursordrop/settings.json")
+    static let logPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/cursordrop/cursordrop.log")
+
+    static let editors: [(name: String, bundleId: String, appData: String)] = [
+        ("Cursor", "com.todesktop.230313mzl4w4u92", "Cursor"),
+        ("Code", "com.microsoft.VSCode", "Code"),
+        ("VS Code", "com.microsoft.VSCode", "Code"),
+        ("Code - Insiders", "com.microsoft.VSCodeInsiders", "Code - Insiders"),
+    ]
+}
+
+// MARK: - Logging
+func log(_ msg: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "\(ts) \(msg)\n"
+    let dir = Config.logPath.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    if let fh = try? FileHandle(forWritingTo: Config.logPath) {
+        fh.seekToEndOfFile()
+        fh.write(line.data(using: .utf8)!)
+        fh.closeFile()
+    } else {
+        try? line.write(to: Config.logPath, atomically: true, encoding: .utf8)
+    }
+}
+
+// MARK: - Settings persistence
+struct Settings: Codable {
+    var pinned: Bool = true
+    var pinOffsetX: CGFloat = -24
+    var pinOffsetY: CGFloat = 20
+    var darkMode: Bool? = nil  // nil = auto-detect
+    var videoFPS: Double = 1.0
+    var windowX: CGFloat?
+    var windowY: CGFloat?
+    var windowW: CGFloat?
+    var windowH: CGFloat?
+}
+
+var settings = Settings()
+
+func loadSettings() {
+    guard let data = try? Data(contentsOf: Config.settingsPath),
+          let s = try? JSONDecoder().decode(Settings.self, from: data) else { return }
+    settings = s
+    Config.videoFPS = s.videoFPS
+}
+
+func saveSettings() {
+    settings.videoFPS = Config.videoFPS
+    let dir = Config.settingsPath.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    if let data = try? JSONEncoder().encode(settings) {
+        try? data.write(to: Config.settingsPath)
+    }
+}
+
+// MARK: - Shell helpers
+func shell(_ cmd: String) -> (output: String, status: Int32) {
+    let task = Process()
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = pipe
+    task.launchPath = "/bin/zsh"
+    task.arguments = ["-c", cmd]
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return ("", -1)
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    return (output, task.terminationStatus)
+}
+
+func shellQuote(_ s: String) -> String {
+    return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+func sanitizeFilename(_ name: String) -> String {
+    let cleaned = name.replacingOccurrences(of: " ", with: "_")
+    return cleaned.filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" }
+}
+
+func timestamp() -> String {
+    let df = DateFormatter()
+    df.dateFormat = "yyyyMMdd-HHmmss"
+    return df.string(from: Date())
+}
+
+// MARK: - Editor context detection
+struct EditorContext {
+    var alias: String
+    var workspace: String
+}
+
+func findEditorContext() -> EditorContext? {
+    let ws = NSWorkspace.shared
+
+    // Try frontmost app first, then search for any editor
+    var editorApp: NSRunningApplication?
+    var matchedEditor: (name: String, bundleId: String, appData: String)?
+
+    if let front = ws.frontmostApplication {
+        for ed in Config.editors {
+            if front.bundleIdentifier == ed.bundleId {
+                editorApp = front
+                matchedEditor = ed
+                break
+            }
+        }
+    }
+
+    if matchedEditor == nil {
+        for app in ws.runningApplications {
+            for ed in Config.editors {
+                if app.bundleIdentifier == ed.bundleId {
+                    editorApp = app
+                    matchedEditor = ed
+                    break
+                }
+            }
+            if matchedEditor != nil { break }
+        }
+    }
+
+    guard let editor = matchedEditor, let app = editorApp else {
+        log("No editor found")
+        return nil
+    }
+
+    // Get window title — try multiple methods
+    var title = ""
+
+    // Method 1: AXUIElement (needs Accessibility)
+    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    var windowsRef: CFTypeRef?
+    let axResult = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+    log("AX result: \(axResult.rawValue) (0=success)")
+
+    if axResult == .success, let axWindows = windowsRef as? [AXUIElement] {
+        log("AX windows count: \(axWindows.count)")
+        for axWindow in axWindows {
+            var titleRef: CFTypeRef?
+            let titleResult = AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+            if titleResult == .success, let windowTitle = titleRef as? String, !windowTitle.isEmpty {
+                title = windowTitle
+                log("AX title found: \(title)")
+                break
+            } else {
+                log("AX title result: \(titleResult.rawValue)")
+            }
+        }
+    }
+
+    // Method 2: NSAppleScript (needs Automation for System Events)
+    if title.isEmpty {
+        let script = NSAppleScript(source: "tell application \"System Events\" to get name of first window of process \"\(editor.name)\"")
+        var errorInfo: NSDictionary?
+        if let result = script?.executeAndReturnError(&errorInfo) {
+            title = result.stringValue ?? ""
+            log("AppleScript title: \(title)")
+        } else {
+            log("AppleScript error: \(errorInfo ?? [:])")
+        }
+    }
+
+    // Method 3: CGWindowList (needs Screen Recording)
+    if title.isEmpty {
+        if let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for window in windows {
+                if let pid = window[kCGWindowOwnerPID as String] as? Int,
+                   pid == Int(app.processIdentifier),
+                   let name = window[kCGWindowName as String] as? String,
+                   !name.isEmpty {
+                    title = name
+                    log("CGWindow title: \(title)")
+                    break
+                }
+            }
+        }
+    }
+
+    log("Editor: \(editor.name) | title: \(title)")
+
+    // Extract SSH alias from [SSH: alias]
+    guard let match = title.range(of: #"\[SSH:\s*([^\]]+)\]"#, options: .regularExpression),
+          let aliasMatch = title[match].range(of: #"(?<=SSH:\s?)\s*[^\]]+"#, options: .regularExpression) else {
+        log("No SSH alias in title")
+        return nil
+    }
+    let alias = String(title[aliasMatch]).trimmingCharacters(in: .whitespaces)
+
+    // Resolve workspace from storage.json
+    guard let workspace = getEditorRemoteWorkspace(alias: alias, appData: editor.appData) else {
+        return nil
+    }
+
+    log("Context: alias=\(alias) workspace=\(workspace)")
+    return EditorContext(alias: alias, workspace: workspace)
+}
+
+func getEditorRemoteWorkspace(alias: String, appData: String) -> String? {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let paths = [
+        "\(home)/Library/Application Support/\(appData)/User/globalStorage/storage.json",
+        "\(home)/Library/Application Support/\(appData)/storage.json"
+    ]
+
+    var content: String?
+    for p in paths {
+        if let c = try? String(contentsOfFile: p, encoding: .utf8) {
+            content = c
+            log("Reading: \(p)")
+            break
+        }
+    }
+
+    guard let json = content else {
+        log("No storage.json for \(appData)")
+        return nil
+    }
+
+    // Format B: hex-encoded JSON (Cursor)
+    let jsonStr = "{\"hostName\":\"\(alias)\"}"
+    let hexStr = jsonStr.utf8.map { String(format: "%02x", $0) }.joined()
+    let needleB = "vscode-remote://ssh-remote%2B\(hexStr)"
+
+    if let range = json.range(of: needleB) {
+        let after = json[range.upperBound...]
+        if let endQuote = after.firstIndex(of: "\"") {
+            var path = String(after[after.startIndex..<endQuote])
+            path = path.removingPercentEncoding ?? path
+            log("Workspace (B): \(path)")
+            return path
+        }
+    }
+
+    // Format A: plain alias (VS Code)
+    let needleA = "vscode-remote://ssh-remote+\(alias)"
+    if let range = json.range(of: needleA) {
+        let after = json[range.upperBound...]
+        if let endQuote = after.firstIndex(of: "\"") {
+            var path = String(after[after.startIndex..<endQuote])
+            path = path.removingPercentEncoding ?? path
+            log("Workspace (A): \(path)")
+            return path
+        }
+    }
+
+    log("No URI for '\(alias)'")
+    return nil
+}
+
+// MARK: - Video frame extraction
+func isVideoFile(_ path: String) -> Bool {
+    let ext = (path as NSString).pathExtension.lowercased()
+    return Config.videoExts.contains(ext)
+}
+
+func hasFFmpeg() -> Bool {
+    let (_, status) = shell("which ffmpeg")
+    return status == 0
+}
+
+func extractVideoFrames(_ videoPath: String, statusCallback: @escaping (String) -> Void) -> (frames: [String], frameDir: String?) {
+    if !hasFFmpeg() {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "FFmpeg required"
+            alert.informativeText = "Install with: brew install ffmpeg\n\nOr download from https://ffmpeg.org"
+            alert.addButton(withTitle: "Open download page")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(string: "https://ffmpeg.org/download.html")!)
+            }
+        }
+        return ([], nil)
+    }
+
+    let ts = timestamp()
+    let frameDir = Config.clipDir.appendingPathComponent("frames-\(ts)").path
+    try? FileManager.default.createDirectory(atPath: frameDir, withIntermediateDirectories: true)
+
+    // Copy to clean temp path (handles Unicode filenames)
+    let ext = (videoPath as NSString).pathExtension
+    let tempVideo = Config.clipDir.appendingPathComponent("tempvideo-\(ts).\(ext)").path
+    do {
+        try FileManager.default.copyItem(atPath: videoPath, toPath: tempVideo)
+    } catch {
+        log("Failed to copy video: \(error)")
+        return ([], nil)
+    }
+
+    // Get duration
+    let (probeOut, _) = shell("ffprobe -v error -show_entries format=duration -of csv=p=0 \(shellQuote(tempVideo))")
+    let cleanDuration = probeOut.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let duration = Double(cleanDuration), duration > 0 else {
+        log("Could not get duration: \(cleanDuration)")
+        try? FileManager.default.removeItem(atPath: tempVideo)
+        return ([], nil)
+    }
+
+    var clipDuration = min(duration, Double(Config.videoMaxSec))
+    var expectedFrames = Int(ceil(clipDuration * Config.videoFPS))
+
+    // Hard cap
+    if expectedFrames > Config.maxFrames {
+        clipDuration = Double(Config.maxFrames) / Config.videoFPS
+        expectedFrames = Config.maxFrames
+    }
+
+    if duration > Double(Config.videoMaxSec) {
+        // On background thread, can't show alert — just clip silently
+        log("Video \(Int(duration))s > \(Config.videoMaxSec)s max, clipping")
+    }
+
+    statusCallback("Extracting \(expectedFrames) frames...")
+    log("Extracting: \(Int(duration))s → \(expectedFrames) frames")
+
+    let (_, ffStatus) = shell("ffmpeg -i \(shellQuote(tempVideo)) -t \(clipDuration) -vf \"fps=\(Config.videoFPS)\" -q:v 2 \(shellQuote(frameDir))/frame_%03d.jpg -y 2>/dev/null")
+
+    try? FileManager.default.removeItem(atPath: tempVideo)
+
+    if ffStatus != 0 {
+        log("ffmpeg failed")
+        return ([], frameDir)
+    }
+
+    let frames = (try? FileManager.default.contentsOfDirectory(atPath: frameDir))?
+        .filter { $0.hasSuffix(".jpg") }
+        .sorted()
+        .map { "\(frameDir)/\($0)" } ?? []
+
+    log("Got \(frames.count) frames")
+    return (frames, frameDir)
+}
+
+// MARK: - Upload
+func processFiles(_ files: [String], ctx: EditorContext, statusCallback: @escaping (String) -> Void) {
+    let remoteBase = "\(ctx.workspace)/\(Config.remoteSubdir)"
+
+    // Separate videos from regular files
+    var regularFiles: [String] = []
+    var videoFiles: [String] = []
+    for f in files {
+        if isVideoFile(f) { videoFiles.append(f) }
+        else { regularFiles.append(f) }
+    }
+
+    // Process videos
+    var videoPaths: [String] = []
+    var videoDirMaps: [(localDir: String, remoteDir: String)] = []
+    var tempFrameDirs: [String] = []
+
+    for videoPath in videoFiles {
+        let (frames, frameDir) = extractVideoFrames(videoPath, statusCallback: statusCallback)
+        guard !frames.isEmpty, let fDir = frameDir else { continue }
+        tempFrameDirs.append(fDir)
+
+        let vname = (videoPath as NSString).lastPathComponent
+        let nameNoExt = (vname as NSString).deletingPathExtension
+        let ts = timestamp()
+        let folderName = "\(ts)-\(sanitizeFilename(nameNoExt))-frames"
+        let remoteVideoDir = "\(remoteBase)/\(folderName)"
+
+        videoPaths.append(remoteVideoDir)
+        videoDirMaps.append((localDir: fDir, remoteDir: remoteVideoDir))
+    }
+
+    // Build regular file remote paths
+    var remoteFiles: [String] = []
+    var localFiles: [String] = []
+    var touchParts = ""
+
+    for f in regularFiles {
+        let fname = (f as NSString).lastPathComponent
+        let ts = timestamp()
+        let remoteName = "\(ts)-\(sanitizeFilename(fname))"
+        let remotePath = "\(remoteBase)/\(remoteName)"
+        remoteFiles.append(remotePath)
+        localFiles.append(f)
+        touchParts += " \(shellQuote(remotePath))"
+    }
+
+    guard !remoteFiles.isEmpty || !videoPaths.isEmpty else { return }
+
+    // Build payload and paste IMMEDIATELY
+    var payload = ""
+    for vp in videoPaths {
+        payload += (payload.isEmpty ? "" : " ") + "'\(vp)/'"
+    }
+    for rp in remoteFiles {
+        payload += (payload.isEmpty ? "" : " ") + "'\(rp)'"
+    }
+
+    // Paste into clipboard and activate editor
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(payload, forType: .string)
+
+    // Activate editor and paste via AppleScript
+    DispatchQueue.main.async {
+        for ed in Config.editors {
+            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: ed.bundleId).first {
+                app.activate()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    let pasteScript = NSAppleScript(source: """
+                        tell application "System Events"
+                            keystroke "v" using command down
+                        end tell
+                    """)
+                    var err: NSDictionary?
+                    pasteScript?.executeAndReturnError(&err)
+                    if let err = err {
+                        log("Paste error: \(err)")
+                    }
+                }
+                break
+            }
+        }
+    }
+
+    log("Path pasted instantly")
+
+    // Background: mkdir + touch + scp
+    statusCallback("Syncing...")
+
+    var mkdirParts = shellQuote(remoteBase)
+    for vp in videoPaths { mkdirParts += " \(shellQuote(vp))" }
+
+    var mkCmd = "ssh -o ConnectTimeout=\(Config.sshTimeout) \(ctx.alias) \"mkdir -p \(mkdirParts)\""
+    if !touchParts.isEmpty {
+        mkCmd = "ssh -o ConnectTimeout=\(Config.sshTimeout) \(ctx.alias) \"mkdir -p \(mkdirParts) && touch\(touchParts)\""
+    }
+
+    log("Run: \(mkCmd)")
+    let (_, mkStatus) = shell(mkCmd)
+    if mkStatus != 0 {
+        log("mkdir+touch failed")
+        statusCallback("Remote prep failed")
+        return
+    }
+
+    // SCP regular files
+    var failCount = 0
+    for (i, localPath) in localFiles.enumerated() {
+        let fname = (localPath as NSString).lastPathComponent
+        statusCallback("Syncing \(i+1)/\(localFiles.count + videoDirMaps.count) \(fname)")
+        let cmd = "scp -o ConnectTimeout=\(Config.sshTimeout) \(shellQuote(localPath)) \(ctx.alias):\(shellQuote(remoteFiles[i]))"
+        log("Run: \(cmd)")
+        let (_, s) = shell(cmd)
+        if s != 0 { failCount += 1; log("FAIL scp") }
+        else { log("OK: \(localPath) -> \(remoteFiles[i])") }
+    }
+
+    // SCP video frame directories (one call per video)
+    for (i, vd) in videoDirMaps.enumerated() {
+        statusCallback("Syncing frames \(localFiles.count + i + 1)/\(localFiles.count + videoDirMaps.count)")
+        let cmd = "scp -o ConnectTimeout=\(Config.sshTimeout) \(shellQuote(vd.localDir))/*.jpg \(ctx.alias):\(shellQuote(vd.remoteDir))/"
+        log("Run: \(cmd)")
+        let (_, s) = shell(cmd)
+        if s != 0 { failCount += 1; log("FAIL scp frames") }
+        else { log("OK: frames -> \(vd.remoteDir)") }
+    }
+
+    // Cleanup temp frame dirs
+    for dir in tempFrameDirs {
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
+    let total = localFiles.count + videoDirMaps.count
+    if failCount > 0 {
+        statusCallback("\(failCount) upload(s) failed")
+    } else {
+        statusCallback("\(total) file\(total > 1 ? "s" : "") ready")
+    }
+}
+
+// MARK: - Drop Zone Window
+class DropZoneView: NSView {
+    var onDrop: (([String]) -> Void)?
+    var isHovered = false
+    weak var parentWindow: DropZoneWindow?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+        wantsLayer = true
+        layer?.cornerRadius = min(frame.height / 2, 22)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        isHovered = true
+        if let win = parentWindow {
+            let hoverBg: NSColor = win.isDark
+                ? NSColor(red: 0.11, green: 0.20, blue: 0.16, alpha: 0.95)
+                : NSColor(red: 0.91, green: 0.96, blue: 0.93, alpha: 0.95)
+            let hoverText: NSColor = win.isDark
+                ? NSColor(red: 0.50, green: 0.83, blue: 0.63, alpha: 1)
+                : NSColor(red: 0.18, green: 0.55, blue: 0.30, alpha: 1)
+            layer?.backgroundColor = hoverBg.cgColor
+            win.titleLabel.textColor = hoverText
+            win.titleLabel.stringValue = "Release"
+            win.subtitleLabel.isHidden = true
+        }
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        isHovered = false
+        parentWindow?.updateColors()
+        parentWindow?.resetLabels()
+        parentWindow?.subtitleLabel.isHidden = false
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        isHovered = false
+        parentWindow?.updateColors()
+        parentWindow?.subtitleLabel.isHidden = false
+
+        guard let items = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL] else { return false }
+
+        let paths = items.map { $0.path }
+        onDrop?(paths)
+        return true
+    }
+}
+
+class DropZoneWindow: NSPanel {
+    var dropView: DropZoneView!
+    var titleLabel: NSTextField!
+    var subtitleLabel: NSTextField!
+    var statusCallback: ((String) -> Void)!
+    var pinned = true
+    var pinOffsetX: CGFloat = -24
+    var pinOffsetY: CGFloat = 20
+    var trackingTimer: Timer?
+    var watchTimer: Timer?
+    var watchKnownFiles: Set<String> = []
+    var isDark: Bool
+
+    init() {
+        isDark = Settings().darkMode ?? DropZoneWindow.systemIsDark()
+        loadSettings()
+        isDark = settings.darkMode ?? DropZoneWindow.systemIsDark()
+
+        let w: CGFloat = settings.windowW ?? 160
+        let h: CGFloat = settings.windowH ?? 52
+        let rect = NSRect(x: 0, y: 0, width: w, height: h)
+
+        super.init(contentRect: rect,
+                   styleMask: [.nonactivatingPanel, .borderless],
+                   backing: .buffered,
+                   defer: false)
+
+        level = .statusBar
+        isOpaque = false
+        hasShadow = true
+        backgroundColor = .clear
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        isMovableByWindowBackground = true
+
+        // Drop view
+        dropView = DropZoneView(frame: rect)
+        dropView.parentWindow = self
+        contentView = dropView
+
+        // Labels
+        let labelH: CGFloat = 18
+        let subH: CGFloat = 14
+        let totalH = labelH + subH + 2
+        let labelY = (h - totalH) / 2 + subH + 2
+        let subY = labelY - subH - 2
+
+        titleLabel = NSTextField(labelWithString: "Drop / Paste")
+        titleLabel.frame = NSRect(x: 0, y: labelY, width: w, height: labelH)
+        titleLabel.alignment = .center
+        titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.isBezeled = false
+        titleLabel.drawsBackground = false
+        titleLabel.isEditable = false
+        dropView.addSubview(titleLabel)
+
+        subtitleLabel = NSTextField(labelWithString: "Ctrl+Cmd+V or drag files")
+        subtitleLabel.frame = NSRect(x: 0, y: subY, width: w, height: subH)
+        subtitleLabel.alignment = .center
+        subtitleLabel.font = NSFont.systemFont(ofSize: 9, weight: .regular)
+        subtitleLabel.isBezeled = false
+        subtitleLabel.drawsBackground = false
+        subtitleLabel.isEditable = false
+        dropView.addSubview(subtitleLabel)
+
+        updateColors()
+
+        // Drop handler
+        dropView.onDrop = { [weak self] paths in
+            self?.handleFiles(paths)
+        }
+
+        // Status callback
+        statusCallback = { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.titleLabel.stringValue = msg
+            }
+        }
+
+        // Position
+        pinned = settings.pinned
+        pinOffsetX = settings.pinOffsetX
+        pinOffsetY = settings.pinOffsetY
+
+        if let sx = settings.windowX, let sy = settings.windowY {
+            setFrameOrigin(NSPoint(x: sx, y: sy))
+        } else {
+            positionDefault()
+        }
+
+        if pinned {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.recalcPinOffset()
+            }
+        }
+
+        // Pin tracking
+        trackingTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            self?.trackEditor()
+        }
+
+        // Watch folder
+        try? FileManager.default.createDirectory(at: Config.watchDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: Config.clipDir, withIntermediateDirectories: true)
+        scanWatchFolder()
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.checkWatchFolder()
+        }
+
+        // Right-click menu
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Paste clipboard", action: #selector(pasteClipboard), keyEquivalent: "")
+        menu.addItem(.separator())
+
+        let pinItem = NSMenuItem(title: "Pinned to editor", action: #selector(togglePin), keyEquivalent: "")
+        pinItem.state = pinned ? .on : .off
+        menu.addItem(pinItem)
+
+        let themeItem = NSMenuItem(title: isDark ? "Switch to light" : "Switch to dark",
+                                   action: #selector(toggleTheme), keyEquivalent: "")
+        menu.addItem(themeItem)
+
+        // FPS submenu
+        let fpsMenu = NSMenu()
+        for fps: Double in [0.5, 1, 2, 4] {
+            let label = fps == 0.5 ? "0.5 fps" : fps == 1 ? "1 fps (default)" : fps == 2 ? "2 fps" : "4 fps"
+            let item = NSMenuItem(title: label, action: #selector(setFPS(_:)), keyEquivalent: "")
+            item.tag = Int(fps * 10)
+            item.state = Config.videoFPS == fps ? .on : .off
+            fpsMenu.addItem(item)
+        }
+        let fpsItem = NSMenuItem(title: "Video frame rate", action: nil, keyEquivalent: "")
+        fpsItem.submenu = fpsMenu
+        menu.addItem(fpsItem)
+
+        // Size submenu
+        let sizeMenu = NSMenu()
+        for (label, w, h) in [("Compact", 120, 44), ("Default", 160, 52), ("Medium", 200, 60), ("Large", 260, 72)] as [(String, CGFloat, CGFloat)] {
+            let item = NSMenuItem(title: "\(label) (\(Int(w))×\(Int(h)))", action: #selector(resizePill(_:)), keyEquivalent: "")
+            item.representedObject = NSSize(width: w, height: h)
+            sizeMenu.addItem(item)
+        }
+        let sizeItem = NSMenuItem(title: "Resize", action: nil, keyEquivalent: "")
+        sizeItem.submenu = sizeMenu
+        menu.addItem(sizeItem)
+
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Open watch folder", action: #selector(openWatchFolder), keyEquivalent: "")
+        menu.addItem(withTitle: "Clean remote files...", action: #selector(cleanRemote), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Show log", action: #selector(showLog), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit CursorDrop", action: #selector(quitApp), keyEquivalent: "q")
+
+        dropView.menu = menu
+
+        orderFront(nil)
+        log("CursorDrop started (macOS)")
+    }
+
+    static func systemIsDark() -> Bool {
+        return NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    func updateColors() {
+        let bg: NSColor = isDark ? NSColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 0.95)
+                                 : NSColor(red: 0.98, green: 0.98, blue: 0.98, alpha: 0.95)
+        let text: NSColor = isDark ? NSColor(red: 0.88, green: 0.88, blue: 0.88, alpha: 1)
+                                    : NSColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1)
+        let sub: NSColor = isDark ? NSColor(red: 0.53, green: 0.53, blue: 0.53, alpha: 1)
+                                   : NSColor(red: 0.6, green: 0.6, blue: 0.6, alpha: 1)
+
+        dropView.layer?.backgroundColor = bg.cgColor
+        titleLabel.textColor = text
+        subtitleLabel.textColor = sub
+    }
+
+    func positionDefault() {
+        guard let screen = NSScreen.main else { return }
+        let x = screen.frame.maxX - frame.width - 24
+        let y = screen.frame.minY + 70
+        setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    // MARK: - Pin tracking
+    func recalcPinOffset() {
+        guard let editorFrame = findEditorFrame() else { return }
+        pinOffsetX = frame.origin.x - editorFrame.maxX
+        pinOffsetY = frame.origin.y - editorFrame.minY
+        settings.pinOffsetX = pinOffsetX
+        settings.pinOffsetY = pinOffsetY
+        saveSettings()
+        log("Pin offset: \(pinOffsetX), \(pinOffsetY)")
+    }
+
+    func findEditorFrame() -> NSRect? {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+
+        // Collect all editor PIDs
+        var editorPIDs: Set<Int> = []
+        for ed in Config.editors {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: ed.bundleId) {
+                editorPIDs.insert(Int(app.processIdentifier))
+            }
+        }
+
+        if editorPIDs.isEmpty { return nil }
+
+        // CGWindowListCopyWindowInfo returns windows in front-to-back order.
+        // The first editor window we find is the frontmost/active one.
+        for window in windows {
+            guard let pid = window[kCGWindowOwnerPID as String] as? Int,
+                  editorPIDs.contains(pid),
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"], let y = bounds["Y"],
+                  let w = bounds["Width"], let h = bounds["Height"],
+                  w > 100, h > 100 else { continue }
+
+            // Convert from screen coords (top-left origin) to Cocoa coords (bottom-left)
+            let screenH = NSScreen.main?.frame.height ?? 1080
+            return NSRect(x: x, y: screenH - y - h, width: w, height: h)
+        }
+        return nil
+    }
+
+    func trackEditor() {
+        guard pinned else { return }
+
+        // Skip if mouse is held (dragging)
+        if NSEvent.pressedMouseButtons & 1 != 0 { return }
+
+        guard let editorFrame = findEditorFrame() else { return }
+
+        let targetX = editorFrame.maxX + pinOffsetX
+        let targetY = editorFrame.minY + pinOffsetY
+
+        if abs(frame.origin.x - targetX) <= 1 && abs(frame.origin.y - targetY) <= 1 { return }
+
+        setFrameOrigin(NSPoint(x: targetX, y: targetY))
+    }
+
+    // MARK: - File handling
+    func handleFiles(_ paths: [String]) {
+        guard let ctx = findEditorContext() else {
+            titleLabel.stringValue = "No SSH session"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.resetLabels()
+            }
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            processFiles(paths, ctx: ctx) { msg in
+                DispatchQueue.main.async {
+                    self?.titleLabel.stringValue = msg
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self?.resetLabels()
+            }
+        }
+    }
+
+    func resetLabels() {
+        titleLabel.stringValue = "Drop / Paste"
+        subtitleLabel.stringValue = "Ctrl+Cmd+V or drag files"
+    }
+
+    // MARK: - Clipboard paste
+    @objc func pasteClipboard() {
+        titleLabel.stringValue = "Reading..."
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var files: [String] = []
+
+            // Check for file URLs
+            if let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [
+                .urlReadingFileURLsOnly: true
+            ]) as? [URL], !urls.isEmpty {
+                files = urls.map { $0.path }
+            }
+
+            // Check for image
+            if files.isEmpty, let img = NSImage(pasteboard: NSPasteboard.general) {
+                let ts = timestamp()
+                let outFile = Config.clipDir.appendingPathComponent("clip-\(ts).png")
+                try? FileManager.default.createDirectory(at: Config.clipDir, withIntermediateDirectories: true)
+                if let tiff = img.tiffRepresentation,
+                   let rep = NSBitmapImageRep(data: tiff),
+                   let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: outFile)
+                    files = [outFile.path]
+                }
+            }
+
+            guard !files.isEmpty else {
+                DispatchQueue.main.async {
+                    self?.titleLabel.stringValue = "Empty clipboard"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.resetLabels() }
+                }
+                return
+            }
+
+            self?.handleFilesFromBackground(files)
+        }
+    }
+
+    func handleFilesFromBackground(_ paths: [String]) {
+        guard let ctx = findEditorContext() else {
+            DispatchQueue.main.async { [weak self] in
+                self?.titleLabel.stringValue = "No SSH session"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.resetLabels() }
+            }
+            return
+        }
+
+        processFiles(paths, ctx: ctx) { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.titleLabel.stringValue = msg
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.resetLabels()
+        }
+    }
+
+    // MARK: - Watch folder
+    func scanWatchFolder() {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: Config.watchDir.path) else { return }
+        for f in files where f != ".DS_Store" {
+            watchKnownFiles.insert(Config.watchDir.appendingPathComponent(f).path)
+        }
+        log("Watch folder scanned: \(watchKnownFiles.count) existing")
+    }
+
+    func checkWatchFolder() {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: Config.watchDir.path) else { return }
+
+        var newFiles: [String] = []
+        for f in files where f != ".DS_Store" {
+            let fullPath = Config.watchDir.appendingPathComponent(f).path
+            if !watchKnownFiles.contains(fullPath) {
+                // Check file size stability
+                guard let attrs1 = try? FileManager.default.attributesOfItem(atPath: fullPath),
+                      let size1 = attrs1[.size] as? Int else { continue }
+                Thread.sleep(forTimeInterval: 0.2)
+                guard let attrs2 = try? FileManager.default.attributesOfItem(atPath: fullPath),
+                      let size2 = attrs2[.size] as? Int,
+                      size1 == size2, size2 > 0 else { continue }
+                newFiles.append(fullPath)
+            }
+        }
+
+        guard !newFiles.isEmpty else { return }
+        for f in newFiles { watchKnownFiles.insert(f) }
+
+        log("Watch folder: \(newFiles.count) new file(s)")
+        handleFilesFromBackground(newFiles)
+
+        // Delete local copies
+        for f in newFiles {
+            try? FileManager.default.removeItem(atPath: f)
+            watchKnownFiles.remove(f)
+        }
+    }
+
+    // MARK: - Menu actions
+    @objc func togglePin() {
+        pinned = !pinned
+        if pinned { recalcPinOffset() }
+        settings.pinned = pinned
+        saveSettings()
+    }
+
+    @objc func toggleTheme() {
+        isDark = !isDark
+        settings.darkMode = isDark
+        updateColors()
+        saveSettings()
+    }
+
+    @objc func setFPS(_ sender: NSMenuItem) {
+        Config.videoFPS = Double(sender.tag) / 10.0
+        saveSettings()
+    }
+
+    @objc func resizePill(_ sender: NSMenuItem) {
+        guard let size = sender.representedObject as? NSSize else { return }
+        var f = frame
+        f.size = size
+        setFrame(f, display: true)
+        dropView.frame = NSRect(origin: .zero, size: size)
+        dropView.layer?.cornerRadius = min(size.height / 2, 22)
+
+        let labelH: CGFloat = 18
+        let subH: CGFloat = 14
+        let totalH = labelH + subH + 2
+        let labelY = (size.height - totalH) / 2 + subH + 2
+        let subY = labelY - subH - 2
+
+        titleLabel.frame = NSRect(x: 0, y: labelY, width: size.width, height: labelH)
+        subtitleLabel.frame = NSRect(x: 0, y: subY, width: size.width, height: subH)
+
+        settings.windowW = size.width
+        settings.windowH = size.height
+        saveSettings()
+        if pinned { recalcPinOffset() }
+    }
+
+    @objc func openWatchFolder() {
+        NSWorkspace.shared.open(Config.watchDir)
+    }
+
+    @objc func cleanRemote() {
+        guard let ctx = findEditorContext() else {
+            titleLabel.stringValue = "No SSH session"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.resetLabels() }
+            return
+        }
+
+        let remoteDir = "\(ctx.workspace)/\(Config.remoteSubdir)"
+        let (countOut, _) = shell("ssh -o ConnectTimeout=\(Config.sshTimeout) \(ctx.alias) \"ls -1 \(shellQuote(remoteDir)) 2>/dev/null | wc -l\"")
+        let count = Int(countOut.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+
+        if count == 0 {
+            titleLabel.stringValue = "Already clean"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.resetLabels() }
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Clean remote files?"
+        alert.informativeText = "Delete all \(count) file(s) in:\n\(ctx.alias):\(remoteDir)\n\nThis cannot be undone."
+        alert.addButton(withTitle: "Delete All")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            titleLabel.stringValue = "Deleting..."
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let (_, s) = shell("ssh -o ConnectTimeout=\(Config.sshTimeout) \(ctx.alias) \"rm -rf \(shellQuote(remoteDir))/*\"")
+                DispatchQueue.main.async {
+                    self?.titleLabel.stringValue = s == 0 ? "\(count) deleted" : "Clean failed"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.resetLabels() }
+                }
+            }
+        }
+    }
+
+    @objc func showLog() {
+        NSWorkspace.shared.open(Config.logPath)
+    }
+
+    @objc func quitApp() {
+        settings.windowX = frame.origin.x
+        settings.windowY = frame.origin.y
+        settings.windowW = frame.width
+        settings.windowH = frame.height
+        saveSettings()
+        NSApp.terminate(nil)
+    }
+
+    // Save position on move
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        if pinned {
+            recalcPinOffset()
+        }
+        settings.windowX = frame.origin.x
+        settings.windowY = frame.origin.y
+        saveSettings()
+    }
+}
+
+// MARK: - App Delegate
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var window: DropZoneWindow!
+    var statusItem: NSStatusItem!
+    var globalHotkey: Any?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Menubar icon
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.title = "⬆"
+        statusItem.button?.action = #selector(statusBarClicked)
+        statusItem.button?.target = self
+
+        // Floating window
+        window = DropZoneWindow()
+
+        // Global hotkey: Ctrl+Cmd+V
+        globalHotkey = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.modifierFlags.contains([.control, .command]) && event.keyCode == 0x09 { // V
+                self?.window.pasteClipboard()
+            }
+        }
+        // Local hotkey too
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.modifierFlags.contains([.control, .command]) && event.keyCode == 0x09 {
+                self?.window.pasteClipboard()
+                return nil
+            }
+            return event
+        }
+
+        log("App ready. Ctrl+Cmd+V to paste.")
+    }
+
+    @objc func statusBarClicked() {
+        window.pasteClipboard()
+    }
+}
+
+// MARK: - Main
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)  // No dock icon
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
